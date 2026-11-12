@@ -8,7 +8,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from .activity_log import ActivityLog, background_console
+from .activity_log import ActivityLog, development_console
 from .core import (
     AppConfig, EvaluationError, load_config,
     JobRecord, load_jobs, open_database, pending_count, polish_requirements,
@@ -583,7 +583,7 @@ def run() -> None:
     activity_log = None
     try:
         directory = prepare_data_directory()
-        activity_log = ActivityLog(directory, background_console())
+        activity_log = ActivityLog(directory, development_console())
         CareerApp(root, directory, activity_log)
     except (EvaluationError, OSError, UnicodeError, sqlite3.Error) as exc:
         if activity_log is not None:

@@ -1,5 +1,4 @@
 from datetime import datetime
-import os
 from pathlib import Path
 import re
 import sys
@@ -49,15 +48,5 @@ class ActivityLog:
         self.stream.close()
 
 
-def background_console() -> TextIO | None:
-    if sys.stdout is not None:
-        return sys.stdout
-    if os.name == "nt":
-        import ctypes
-
-        if not ctypes.windll.kernel32.GetConsoleWindow() and not ctypes.windll.kernel32.AllocConsole():
-            raise OSError("Unable to open the background console")
-        if not ctypes.windll.kernel32.SetConsoleOutputCP(65001):
-            raise OSError("Unable to set the background console encoding")
-        return open("CONOUT$", "w", encoding="utf-8", errors="backslashreplace", buffering=1)
-    return None
+def development_console() -> TextIO | None:
+    return None if getattr(sys, "frozen", False) else sys.stdout

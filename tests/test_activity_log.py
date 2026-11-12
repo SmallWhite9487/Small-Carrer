@@ -6,11 +6,30 @@ import tkinter as tk
 import unittest
 from unittest.mock import patch
 
-from modules.activity_log import ActivityLog
+from modules.activity_log import ActivityLog, development_console
 from modules.app import BatchDone, CareerApp, CrawlDone, ErrorEvent, ProgressEvent
 
 
 class ActivityLogTests(unittest.TestCase):
+    def test_console_output_is_only_used_in_development(self):
+        output = io.StringIO()
+        with patch("modules.activity_log.sys.stdout", output), \
+                patch("modules.activity_log.sys.frozen", False, create=True):
+            self.assertIs(development_console(), output)
+        with patch("modules.activity_log.sys.stdout", None), \
+                patch("modules.activity_log.sys.frozen", False, create=True):
+            self.assertIsNone(development_console())
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("modules.activity_log.sys.stdout", output), \
+                    patch("modules.activity_log.sys.frozen", True, create=True):
+                log = ActivityLog(Path(directory), development_console())
+                try:
+                    log.write("INFO", "packaged log")
+                finally:
+                    log.close()
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("packaged log", log.path.read_text(encoding="utf-8"))
+
     def test_format_console_and_rotation_preserve_unrelated_files(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)

@@ -35,7 +35,7 @@
 
 首次使用新版會將舊位置的設定、SQLite、CSV 和日誌複製到 `data`，不覆寫已有資料，舊檔也不會刪除。完成後不再自動匯入；確認資料齊全後可自行移除舊檔。整個 `data` 已排除於 Git 之外。
 
-日誌會遮住網址和已知金鑰，但仍請先檢查內容再分享。以上資料都已加入 Git 排除規則。
+開發時日誌會同步顯示在 IDE 終端；分發的 EXE 不會開啟命令列視窗，只將日誌寫入 `data\log`。日誌會遮住網址和已知金鑰，但仍請先檢查內容再分享。以上資料都已加入 Git 排除規則。
 
 這裡保留 SQLite，是因為它能記住哪些職缺已處理、哪些需要重試，也比較不怕寫到一半中斷。它是 Python 內建功能，不用另外安裝資料庫。CSV 則留給你查看和使用結果。
 
@@ -58,12 +58,16 @@ python -W error -m unittest discover -s tests -v
 ## 打包成 Windows EXE
 
 ```powershell
-.\packing\build.ps1
+.\packing\build.cmd
 ```
 
 輸出為 **`packing\dist\SmallCareer.exe`**，是包含瀏覽器的 onefile 版本，使用者不用再安裝 Python 或瀏覽器。打包過程需要網路；工具、快取及輸出都放在 `packing`。
 
+也可以直接雙擊 `packing\build.cmd`，完成或失敗後視窗會保留，按任意鍵關閉。自動執行時可加上 `--no-pause`。
+
 圖示使用 `packing\icon.ico`，檔案版本資訊使用 `packing\version_info.txt`；修改後重新打包即可。`packing\SmallCareer.spec` 是打包設定，請保留在版本控制中。
+
+打包後會通知 Windows 更新 EXE 的檔案圖示。若檔案總管仍顯示舊圖示或空白，先重新整理，或將 EXE 複製到另一個資料夾確認；Windows 可能仍保留同一路徑的舊快取。檔案圖示與開啟後的視窗圖示是分別設定的。
 
 分發產物只有一個 EXE。因為連瀏覽器一起裝進去，EXE 會很大，每次啟動解壓可能比較慢，也需要足夠的系統暫存空間。使用後會建立 `data`；PyInstaller 啟動所需的解壓檔仍由系統暫存目錄管理，不是使用者工作資料。
 
