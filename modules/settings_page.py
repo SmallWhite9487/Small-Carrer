@@ -4,7 +4,7 @@ from typing import Callable
 
 from .core import AppConfig
 from .i18n import Language, translate
-from .ui import BORDER, SURFACE, TEXT, ScrollArea
+from .ui import BORDER, SURFACE, TEXT, ScrollArea, configure_window_icon
 
 
 class RequirementsPreview(tk.Toplevel):
@@ -13,6 +13,7 @@ class RequirementsPreview(tk.Toplevel):
         on_apply: Callable[[str], None], on_cancel: Callable[[], None],
     ) -> None:
         super().__init__(parent)
+        configure_window_icon(self)
         self.language = language
         self.on_apply, self.on_cancel = on_apply, on_cancel
         self.title(translate(language, "polish_preview"))
@@ -100,11 +101,15 @@ class SettingsPage(ttk.Frame):
         service = ttk.Frame(self.scroll.body, style="Card.TFrame", padding=20)
         service.pack(fill="x", pady=(0, 16))
         self.add_label(service, "provider", title=True)
-        self.provider_box = ttk.Combobox(service, state="readonly",
-                                         values=("OpenAI", "Gemini", "Custom"))
-        self.provider_box.current(("openai", "gemini", "custom").index(self.provider))
-        self.provider_box.bind("<<ComboboxSelected>>", self.switch_provider)
-        self.provider_box.pack(fill="x", pady=(6, 12))
+        tabs = ttk.Frame(service, style="Card.TFrame")
+        tabs.pack(fill="x", pady=(6, 0))
+        self.provider_buttons: dict[str, ttk.Button] = {}
+        for provider in ("openai", "gemini", "custom"):
+            button = ttk.Button(tabs, style="ProviderTab.TButton",
+                                command=lambda name=provider: self.switch_provider(name))
+            button.pack(side="left", padx=(0, 4))
+            self.provider_buttons[provider] = button
+        ttk.Separator(service).pack(fill="x", pady=(0, 12))
         self.add_label(service, "api_key", title=True)
         self.key_entry = ttk.Entry(service, show="*")
         self.key_entry.insert(0, config["api_key"])
@@ -132,13 +137,15 @@ class SettingsPage(ttk.Frame):
         self.save_button.pack(anchor="w", pady=(16, 0))
         self.refresh_language(self.language)
 
-    def switch_provider(self, event: tk.Event) -> None:
+    def switch_provider(self, provider: str) -> None:
+        if provider == self.provider:
+            return
         self.profiles[self.provider] = {
             "base_url": self.entries["base_url"].get(),
             "model": self.entries["model"].get(),
             "api_key": self.key_entry.get(),
         }
-        self.provider = ("openai", "gemini", "custom")[self.provider_box.current()]
+        self.provider = provider
         defaults = {
             "openai": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "api_key": ""},
             "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta",
@@ -151,7 +158,16 @@ class SettingsPage(ttk.Frame):
             self.entries[field].insert(0, profile[field])
         self.key_entry.delete(0, "end")
         self.key_entry.insert(0, profile["api_key"])
+        self.refresh_provider_tabs()
         self.on_provider(self.provider)
+
+    def refresh_provider_tabs(self) -> None:
+        for provider, button in self.provider_buttons.items():
+            button.configure(
+                text=(translate(self.language, "provider_custom") if provider == "custom"
+                      else {"openai": "OpenAI", "gemini": "Gemini"}[provider]),
+                style=("Selected.ProviderTab.TButton" if provider == self.provider
+                       else "ProviderTab.TButton"))
 
     def copy_key(self, event: tk.Event) -> str:
         if self.key_entry.selection_present():
@@ -188,6 +204,7 @@ class SettingsPage(ttk.Frame):
 
     def refresh_language(self, language: Language) -> None:
         self.language = language
+        self.refresh_provider_tabs()
         self.title_label.configure(text=translate(language, "settings_tab"))
         self.intro.configure(text=translate(language, "settings_intro"))
         for key, label in self.labels.items():
@@ -225,6 +242,6 @@ class SettingsPage(ttk.Frame):
         for entry in (*self.entries.values(), self.key_entry):
             entry.configure(state=state)
         self.requirements.configure(state=state)
-        self.provider_box.configure(state="disabled" if busy else "readonly")
-        for button in (self.save_button, self.polish_button, self.advanced_button):
+        for button in (self.save_button, self.polish_button, self.advanced_button,
+                       *self.provider_buttons.values()):
             button.state(["disabled"] if busy else ["!disabled"])

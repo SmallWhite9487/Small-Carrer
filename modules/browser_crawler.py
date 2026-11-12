@@ -4,6 +4,7 @@ import re
 import sys
 import threading
 import time
+import tempfile
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -14,13 +15,17 @@ from .crawler import Crawler, MAX_BYTES, TIMEOUT, USER_AGENT, normalize_url, ori
 
 
 class BrowserCrawler(Crawler):
-    def __init__(self, website: str, stop: threading.Event | None = None) -> None:
+    def __init__(
+        self, website: str, stop: threading.Event | None = None, *, directory: Path | None = None,
+    ) -> None:
         super().__init__(website, stop)
         self.runtime: Playwright | None = None
         self.browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
         self.blocked: EvaluationError | None = None
+        self.directory = directory
+        self.workspace: tempfile.TemporaryDirectory | None = None
 
     def prepare(self) -> None:
         super().prepare()
@@ -31,10 +36,23 @@ class BrowserCrawler(Crawler):
         if getattr(sys, "frozen", False):
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(
                 Path(getattr(sys, "_MEIPASS")) / "browsers")
+        if self.directory is None:
+            from .data_paths import prepare_data_directory
+
+            self.directory = prepare_data_directory()
+        browser_directory = self.directory / "browser"
+        browser_directory.mkdir(parents=True, exist_ok=True)
+        self.workspace = tempfile.TemporaryDirectory(prefix="session-", dir=browser_directory)
+        workspace = Path(self.workspace.name)
+        environment = {**os.environ, "TEMP": str(workspace), "TMP": str(workspace),
+                       "TMPDIR": str(workspace)}
         try:
             self.runtime = sync_playwright().start()
-            self.browser = self.runtime.chromium.launch(headless=False)
-            self.context = self.browser.new_context(user_agent=USER_AGENT, accept_downloads=False)
+            self.context = self.runtime.chromium.launch_persistent_context(
+                user_data_dir=str(workspace / "profile"), headless=False, env=environment,
+                downloads_path=str(workspace / "downloads"), traces_dir=str(workspace / "traces"),
+                user_agent=USER_AGENT, accept_downloads=False)
+            self.browser = self.context.browser
             self.context.route("**/*", self.guard_request)
             self.page = self.context.new_page()
         except Error as exc:
@@ -120,9 +138,14 @@ class BrowserCrawler(Crawler):
             if self.browser is not None:
                 self.browser.close()
         finally:
-            if self.runtime is not None:
-                self.runtime.stop()
-            self.browser = None
-            self.runtime = None
-            self.context = None
-            self.page = None
+            try:
+                if self.runtime is not None:
+                    self.runtime.stop()
+            finally:
+                self.browser = None
+                self.runtime = None
+                self.context = None
+                self.page = None
+                if self.workspace is not None:
+                    self.workspace.cleanup()
+                    self.workspace = None

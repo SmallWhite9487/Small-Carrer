@@ -10,11 +10,12 @@ from tkinter import messagebox, ttk
 
 from .activity_log import ActivityLog, background_console
 from .core import (
-    AppConfig, EvaluationError, app_directory, load_config,
+    AppConfig, EvaluationError, load_config,
     JobRecord, load_jobs, open_database, pending_count, polish_requirements,
     process_pending, save_config, validate_config,
 )
 from .crawler import crawl_to_queue, normalize_url
+from .data_paths import prepare_data_directory
 from .evaluation_page import EvaluationPage
 from .home_page import HomePage
 from .i18n import Language, translate
@@ -89,13 +90,19 @@ class CareerApp:
                                 command=lambda page=key: self.show_page(page))
             button.pack(fill="x", pady=4)
             self.nav_buttons[key] = button
+        sidebar_footer = ttk.Frame(sidebar, style="Sidebar.TFrame")
+        sidebar_footer.pack(side="bottom", fill="x")
+        self.language_button = ttk.Button(sidebar_footer, text="A/文", width=5,
+                                         style="Language.TButton", command=self.toggle_language)
+        self.language_button.pack(anchor="w", pady=(0, 12))
+        self.signature = ttk.Label(sidebar_footer,
+                                   text="Small Carrer v1.0\nBy SmallWhite Studio",
+                                   style="SidebarFooter.TLabel", justify="left")
+        self.signature.pack(anchor="w")
         right = ttk.Frame(root)
         right.pack(side="left", fill="both", expand=True)
         footer = ttk.Frame(right, padding=(12, 8))
         footer.pack(side="bottom", fill="x")
-        self.language_button = ttk.Button(footer, text="A/文", width=5,
-                                         style="Language.TButton", command=self.toggle_language)
-        self.language_button.pack(side="right")
         self.page_host = ttk.Frame(right)
         self.page_host.pack(fill="both", expand=True)
         self.page_host.columnconfigure(0, weight=1)
@@ -565,13 +572,20 @@ class CareerApp:
 
 
 def run() -> None:
+    if os.name == "nt":
+        import ctypes
+
+        result = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "SmallWhiteStudio.SmallCareer")
+        if result != 0:
+            raise OSError(f"Unable to set application identity: {result}")
     root = tk.Tk()
     activity_log = None
     try:
-        directory = app_directory()
+        directory = prepare_data_directory()
         activity_log = ActivityLog(directory, background_console())
         CareerApp(root, directory, activity_log)
-    except (EvaluationError, OSError, UnicodeError) as exc:
+    except (EvaluationError, OSError, UnicodeError, sqlite3.Error) as exc:
         if activity_log is not None:
             activity_log.close()
         detail = exc.localized("zh-TW") if isinstance(exc, EvaluationError) else str(exc)

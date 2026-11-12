@@ -1,4 +1,5 @@
 config*.json
+data/
 *.sqlite3
 *.sqlite3-*
 *.sqlite
@@ -12,6 +13,7 @@ log/
 build/
 dist/
 *.spec
-packing/browsers/
+packing/
+packing
 __pycache__/
 *.py[cod]

@@ -308,7 +308,7 @@ def crawl_to_queue(
     if browser:
         from .browser_crawler import BrowserCrawler
 
-        crawler = BrowserCrawler(website, stop)
+        crawler = BrowserCrawler(website, stop, directory=directory)
     else:
         crawler = Crawler(website, stop)
     connection = open_database(directory / "jobs.sqlite3")

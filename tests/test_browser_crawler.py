@@ -38,16 +38,22 @@ setTimeout(() => {
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         base = f"http://127.0.0.1:{server.server_port}"
-        client = BrowserCrawler(base + "/search")
+        workspace = tempfile.TemporaryDirectory()
+        client = BrowserCrawler(base + "/search", directory=Path(workspace.name))
         try:
             client.prepare()
             html, url = client._get(client.website)
             self.assertEqual(crawler.listing_links(html, url).links, [base + "/jobs/123"])
             self.assertEqual(crawler.next_page(html, url), base + "/search?page=2")
+            self.assertTrue(Path(client.workspace.name).is_relative_to(Path(workspace.name) / "browser"))
+            profile = Path(client.workspace.name)
+            self.assertTrue((profile / "profile").is_dir())
             with self.assertRaises(core.EvaluationError):
                 client._get(base + "/private/")
         finally:
             client.close()
+            self.assertFalse(profile.exists())
+            workspace.cleanup()
             server.shutdown()
             server.server_close()
             thread.join()

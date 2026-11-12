@@ -1,3 +1,5 @@
+from pathlib import Path
+import sys
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable
@@ -12,7 +14,17 @@ SIDEBAR = "#172339"
 BORDER = "#E2E7F0"
 
 
+def configure_window_icon(window: tk.Tk | tk.Toplevel) -> None:
+    resources = (Path(getattr(sys, "_MEIPASS")) if getattr(sys, "frozen", False)
+                 else Path(__file__).resolve().parent.parent / "packing")
+    if sys.platform == "win32":
+        window.iconbitmap(str(resources / "icon.ico"))
+        if isinstance(window, tk.Tk):
+            window.iconbitmap(default=str(resources / "icon.ico"))
+
+
 def configure_style(root: tk.Tk) -> None:
+    configure_window_icon(root)
     root.configure(background=BG)
     root.option_add("*Text.Font", ("Microsoft JhengHei UI", 10))
     style = ttk.Style(root)
@@ -23,6 +35,8 @@ def configure_style(root: tk.Tk) -> None:
     style.configure("Sidebar.TFrame", background=SIDEBAR)
     style.configure("Brand.TLabel", background=SIDEBAR, foreground=SURFACE,
                     font=("Segoe UI", 16, "bold"))
+    style.configure("SidebarFooter.TLabel", background=SIDEBAR, foreground="#BDC9DF",
+                    font=("Segoe UI", 9))
     style.configure("TLabel", background=BG, foreground=TEXT)
     style.configure("Title.TLabel", font=("Microsoft JhengHei UI", 22, "bold"))
     style.configure("Subtitle.TLabel", foreground=MUTED)
@@ -37,7 +51,15 @@ def configure_style(root: tk.Tk) -> None:
     style.map("Accent.TButton", background=[("disabled", "#B4BFED"), ("active", "#3855C9")],
               foreground=[("disabled", SURFACE), ("!disabled", SURFACE)])
     style.configure("Language.TButton", padding=(10, 6))
+    style.configure("ProviderTab.TButton", background="#E9EEFC", foreground=MUTED,
+                    padding=(20, 10), borderwidth=1, relief="raised")
+    style.map("ProviderTab.TButton", background=[("active", "#DDE5FC")])
+    style.configure("Selected.ProviderTab.TButton", background=SURFACE, foreground=ACCENT,
+                    font=("Microsoft JhengHei UI", 10, "bold"))
+    style.map("Selected.ProviderTab.TButton",
+              background=[("active", SURFACE)], foreground=[("active", ACCENT)])
     style.configure("Nav.TButton", background=SIDEBAR, foreground="#BDC9DF",
+                    font=("Microsoft JhengHei UI", 12, "bold"),
                     anchor="w", padding=(18, 14))
     style.map("Nav.TButton", background=[("active", "#253854")],
               foreground=[("active", SURFACE)])

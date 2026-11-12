@@ -8,6 +8,7 @@ import webbrowser
 from .core import JobRecord
 from .i18n import Language, translate
 from .job_list import CARD_GAP, CARD_HEIGHT, CARD_WIDTH, JobListPage
+from .ui import configure_window_icon
 
 
 def abbreviated(text: str, limit: int) -> str:
@@ -61,6 +62,7 @@ class JobCard(ttk.Frame):
 
     def show_details(self) -> None:
         window = tk.Toplevel(self.winfo_toplevel())
+        configure_window_icon(window)
         window.title(translate(self.language, "job_details"))
         window.geometry("720x640")
         panel = ttk.Frame(window, padding=20)

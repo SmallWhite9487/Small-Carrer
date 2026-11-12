@@ -6,6 +6,7 @@ import runpy
 import string
 import tempfile
 import tkinter as tk
+from tkinter import ttk
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -241,8 +242,7 @@ class DesktopTests(unittest.TestCase):
         app = self.app
         settings = app.settings_page
         settings.key_entry.insert(0, "openai-key")
-        settings.provider_box.current(1)
-        settings.switch_provider(None)
+        settings.provider_buttons["gemini"].invoke()
         self.assertEqual(settings.key_entry.get(), "")
         settings.key_entry.insert(0, "gemini-key")
         app.evaluation_page.website_entry.set("https://example.com/jobs")
@@ -256,15 +256,49 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(persisted["provider"], "gemini")
         self.assertEqual(persisted["api_key"], "gemini-key")
         self.assertEqual(persisted["profiles"]["openai"]["api_key"], "openai-key")
-        settings.provider_box.current(2)
-        settings.switch_provider(None)
+        settings.provider_buttons["custom"].invoke()
         self.assertEqual(settings.key_entry.get(), "")
-        settings.provider_box.current(0)
-        settings.switch_provider(None)
+        settings.provider_buttons["openai"].invoke()
         self.assertEqual(settings.key_entry.get(), "openai-key")
         app.remove_site()
         self.assertEqual(core.load_config(self.path / "config.json")["websites"], [])
         self.assertEqual(core.load_config(self.path / "config.json")["provider"], "gemini")
+
+    def test_provider_tabs_ignore_wheel_and_preserve_drafts_on_language_change(self) -> None:
+        settings = self.app.settings_page
+        self.assertFalse(hasattr(settings, "provider_box"))
+        self.root.deiconify()
+        self.app.show_page("settings")
+        self.root.update()
+        with patch.object(settings, "on_provider") as changed:
+            for button in settings.provider_buttons.values():
+                button.event_generate("<MouseWheel>", delta=-120)
+            self.root.update()
+            self.assertEqual(settings.provider, "openai")
+            changed.assert_not_called()
+            settings.provider_buttons["openai"].invoke()
+            changed.assert_not_called()
+            settings.provider_buttons["custom"].invoke()
+            changed.assert_called_once_with("custom")
+        settings.entries["model"].insert(0, "draft-model")
+        self.app.change_language("en")
+        self.assertEqual(settings.provider_buttons["custom"].cget("text"), "Custom")
+        self.assertEqual(settings.provider_buttons["custom"].cget("style"),
+                         "Selected.ProviderTab.TButton")
+        self.assertEqual(settings.entries["model"].get(), "draft-model")
+        self.app.change_language("zh-TW")
+        self.assertEqual(settings.provider_buttons["custom"].cget("text"), "自訂")
+        settings.provider_buttons["gemini"].invoke()
+        settings.provider_buttons["custom"].invoke()
+        self.assertEqual(settings.entries["model"].get(), "draft-model")
+        settings.set_busy(True)
+        settings.provider_buttons["openai"].invoke()
+        self.assertEqual(settings.provider, "custom")
+        self.assertTrue(all(button.instate(["disabled"])
+                            for button in settings.provider_buttons.values()))
+        settings.set_busy(False)
+        settings.provider_buttons["openai"].invoke()
+        self.assertEqual(settings.provider, "openai")
 
     def test_declined_processing_makes_no_api_call_or_settings_save(self) -> None:
         app = self.app
@@ -385,7 +419,7 @@ class DesktopTests(unittest.TestCase):
                 self.root.clipboard_append(previous)
                 self.root.update()
 
-    def test_language_button_stays_in_bottom_right(self) -> None:
+    def test_language_button_stays_above_signature_in_bottom_left(self) -> None:
         self.root.deiconify()
         for geometry in ("980x650", "1180x820"):
             self.root.geometry(geometry)
@@ -393,14 +427,52 @@ class DesktopTests(unittest.TestCase):
                 self.app.show_page(page)
                 self.root.update()
                 button = self.app.language_button
-                right_margin = self.root.winfo_rootx() + self.root.winfo_width() - (
-                    button.winfo_rootx() + button.winfo_width())
+                signature = self.app.signature
+                left_margin = button.winfo_rootx() - self.root.winfo_rootx()
                 bottom_margin = self.root.winfo_rooty() + self.root.winfo_height() - (
-                    button.winfo_rooty() + button.winfo_height())
-                self.assertGreaterEqual(right_margin, 0)
-                self.assertLessEqual(right_margin, 50)
+                    signature.winfo_rooty() + signature.winfo_height())
+                self.assertGreaterEqual(left_margin, 0)
+                self.assertLessEqual(left_margin, 50)
                 self.assertGreaterEqual(bottom_margin, 0)
                 self.assertLessEqual(bottom_margin, 50)
+                self.assertLessEqual(button.winfo_rooty() + button.winfo_height(),
+                                     signature.winfo_rooty())
+                self.assertEqual(signature.cget("text"),
+                                 "Small Carrer v1.0\nBy SmallWhite Studio")
+                style = ttk.Style(self.root)
+                self.assertEqual(style.lookup("Nav.TButton", "font"),
+                                 style.lookup("Active.Nav.TButton", "font"))
+                self.assertEqual(self.root.tk.splitlist(style.lookup("Nav.TButton", "font"))[1],
+                                 "12")
+
+    @unittest.skipUnless(core.sys.platform == "win32", "Windows ICO support")
+    def test_application_and_detail_window_have_icons(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        user32.SendMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.SendMessageW.restype = wintypes.LPARAM
+        job = core.JobRecord("icon-test", result())
+        self.app.evaluation_page.set_jobs([job])
+        self.app.evaluation_page.cards[job.source].show_details()
+        dialog = next(window for window in self.root.winfo_children()
+                      if isinstance(window, tk.Toplevel))
+        try:
+            self.root.deiconify()
+            self.root.update()
+            for icon_index in (0, 1):
+                root_icon = user32.SendMessageW(
+                    user32.GetParent(self.root.winfo_id()), 0x7F, icon_index, 0)
+                dialog_icon = user32.SendMessageW(
+                    user32.GetParent(dialog.winfo_id()), 0x7F, icon_index, 0)
+                self.assertNotEqual(root_icon, 0)
+                self.assertNotEqual(dialog_icon, 0)
+        finally:
+            dialog.destroy()
 
     def test_language_preserves_inputs_and_restarts(self) -> None:
         app = self.app
