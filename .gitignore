@@ -1,0 +1,17 @@
+config*.json
+*.sqlite3
+*.sqlite3-*
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.csv
+csv/
+log/
+.browser-build/
+build/
+dist/
+*.spec
+packing/browsers/
+__pycache__/
+*.py[cod]
