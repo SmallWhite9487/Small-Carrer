@@ -69,22 +69,4 @@ python -W error -m unittest discover -s tests -v
 
 打包後會通知 Windows 更新 EXE 的檔案圖示。若檔案總管仍顯示舊圖示或空白，先重新整理，或將 EXE 複製到另一個資料夾確認；Windows 可能仍保留同一路徑的舊快取。檔案圖示與開啟後的視窗圖示是分別設定的。
 
-分發產物只有一個 EXE。因為連瀏覽器一起裝進去，EXE 會很大，每次啟動解壓可能比較慢，也需要足夠的系統暫存空間。使用後會建立 `data`；PyInstaller 啟動所需的解壓檔仍由系統暫存目錄管理，不是使用者工作資料。
-
-## 第一次上傳 GitHub
-
-先在 GitHub 建立一個空的 repository，不要先勾選 README。然後在專案目錄執行，把最後的網址換成你自己的：
-
-```powershell
-git init
-git branch -M main
-git add .
-git status --short
-git diff --cached --stat
-# 確認沒有 config、log、CSV、資料庫或打包產物後，再繼續
-git commit -m "Initial commit"
-git remote add origin https://github.com/YOUR_NAME/YOUR_REPOSITORY.git
-git push -u origin main
-```
-
-Git 可能會請你登入 GitHub。如果資料之前已被 Git 追蹤，光加排除規則不會移除它；先檢查再提交。大型 EXE 請放到 GitHub Releases，不要加入原始碼提交。
+分發產物只有一個 EXE。因為連瀏覽器一起裝進去，EXE 會很大，每次啟動解壓可能比較慢，也需要足夠的系統暫存空間。使用後會建立 `data`；PyInstaller 啟動所需的解壓檔仍由系統暫存目錄管理，不是使用者工作資料。s
