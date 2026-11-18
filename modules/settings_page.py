@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable
 
-from .core import AppConfig
+from .core import AppConfig, EvaluationError
 from .i18n import Language, translate
 from .ui import BORDER, SURFACE, TEXT, ScrollArea, configure_window_icon
 
@@ -113,6 +113,33 @@ class SettingsPage(ttk.Frame):
         self.polish_button = ttk.Button(requirements_card, command=on_polish)
         self.polish_button.pack(anchor="w")
         self.add_label(requirements_card, "language_note")
+        sources_card = ttk.Frame(self.scroll.body, style="Card.TFrame", padding=20)
+        sources_card.pack(fill="x", pady=(0, 16))
+        self.add_label(sources_card, "auto_collect", title=True)
+        self.add_label(sources_card, "auto_collect_hint")
+        sources_editor = ttk.Frame(sources_card, style="Card.TFrame")
+        sources_editor.pack(fill="x", pady=12)
+        self.sources = tk.Text(
+            sources_editor, height=6, wrap="none", padx=12, pady=12, relief="flat",
+            background="#F7F9FE", foreground=TEXT, insertbackground=TEXT,
+            highlightthickness=1, highlightbackground=BORDER,
+        )
+        sources_scroll = ttk.Scrollbar(sources_editor, command=self.sources.yview)
+        self.sources.configure(yscrollcommand=sources_scroll.set)
+        sources_scroll.pack(side="right", fill="y")
+        self.sources.pack(fill="x")
+        self.sources.insert("1.0", "\n".join(config.get("job_sources", [])))
+        interval_row = ttk.Frame(sources_card, style="Card.TFrame")
+        interval_row.pack(fill="x", pady=(0, 4))
+        self.hours_label = ttk.Label(interval_row, style="CardMuted.TLabel")
+        self.labels["auto_collect_hours"] = self.hours_label
+        self.hours_label.pack(side="left", padx=(0, 8))
+        self.hours = ttk.Spinbox(interval_row, from_=0, to=168, width=5)
+        self.hours.insert(0, str(config.get("auto_collect_hours", 0)))
+        self.hours.pack(side="left")
+        self.auto_process = tk.BooleanVar(value=config.get("auto_process", True))
+        self.auto_process_button = ttk.Checkbutton(sources_card, variable=self.auto_process)
+        self.auto_process_button.pack(anchor="w", pady=(4, 0))
         service = ttk.Frame(self.scroll.body, style="Card.TFrame", padding=20)
         service.pack(fill="x", pady=(0, 16))
         self.add_label(service, "provider", title=True)
@@ -295,7 +322,8 @@ class SettingsPage(ttk.Frame):
         for key, button in (("save", self.save_button), ("polish", self.polish_button),
                             ("advanced", self.advanced_button), ("reset_db", self.reset_button),
                             ("choose_models", self.choose_models), ("add_model", self.add_model_button),
-                            ("fetch_models", self.fetch_models), ("distribute_models", self.distribute_button)):
+                            ("fetch_models", self.fetch_models), ("distribute_models", self.distribute_button),
+                            ("auto_process", self.auto_process_button)):
             button.configure(text=translate(language, key))
 
     def read_settings(self) -> AppConfig:
@@ -307,6 +335,10 @@ class SettingsPage(ttk.Frame):
             "model": primary,
             "api_key": self.key_entry.get().strip(),
         }
+        try:
+            hours = int(self.hours.get())
+        except ValueError as exc:
+            raise EvaluationError("error.config_extras") from exc
         return AppConfig(
             base_url=self.entries["base_url"].get().strip(),
             model=primary,
@@ -320,6 +352,10 @@ class SettingsPage(ttk.Frame):
             profiles=profiles,
             backup_models={name: models[1:] for name, models in self.models.items() if len(models) > 1},
             distribute_models=self.distribute_models.get(),
+            job_sources=[line.strip() for line in self.sources.get("1.0", "end-1c").splitlines()
+                         if line.strip()],
+            auto_collect_hours=hours,
+            auto_process=self.auto_process.get(),
         )
 
     def apply_requirements(self, text: str) -> None:
@@ -328,11 +364,12 @@ class SettingsPage(ttk.Frame):
 
     def set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
-        for entry in (*self.entries.values(), self.key_entry):
+        for entry in (*self.entries.values(), self.key_entry, self.hours):
             entry.configure(state=state)
         self.requirements.configure(state=state)
+        self.sources.configure(state=state)
         for button in (self.save_button, self.polish_button, self.advanced_button,
                        self.reset_button, self.choose_models, self.fetch_models, self.add_model_button,
-                       self.distribute_button,
+                       self.distribute_button, self.auto_process_button,
                        *self.provider_buttons.values()):
             button.state(["disabled"] if busy else ["!disabled"])

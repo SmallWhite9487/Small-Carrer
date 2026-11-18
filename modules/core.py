@@ -27,6 +27,11 @@ MISSING = "未記載"
 DEFAULT_REQUIREMENTS = 'search for "business analyst" "analyst" remote, USA only'
 DEFAULT_WEBSITE = "https://www.linkedin.com/"
 
+# Public job-board APIs that publish openings for machine reading. LinkedIn is
+# deliberately absent: it has no public job API and forbids automated access.
+SOURCE_PATTERN = re.compile(
+    r"(?:greenhouse|lever|ashby|workable|remotive):[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
 SYSTEM_TEMPLATE = """你是一位熟悉全球招聘與自由職業市場的職位資訊提取與匹配專家。
 解析职位 Markdown，提取关键字段，并严格对照【用户求职要求】分类。
 
@@ -123,6 +128,9 @@ class AppConfig(TypedDict):
     profiles: dict[str, dict[str, str]]
     backup_models: dict[str, list[str]]
     distribute_models: bool
+    job_sources: list[str]
+    auto_collect_hours: int
+    auto_process: bool
 
 
 class EvaluationError(ValueError):
@@ -158,6 +166,9 @@ def default_config() -> AppConfig:
         "profiles": {},
         "backup_models": {},
         "distribute_models": False,
+        "job_sources": [],
+        "auto_collect_hours": 0,
+        "auto_process": True,
     }
 
 
@@ -205,6 +216,15 @@ def validate_config(value: object) -> AppConfig:
     profiles = value.get("profiles", {})
     backups = value.get("backup_models", {})
     distribute = value.get("distribute_models", False)
+    job_sources = value.get("job_sources", [])
+    auto_collect_hours = value.get("auto_collect_hours", 0)
+    auto_process = value.get("auto_process", True)
+    if (not isinstance(job_sources, list)
+            or not all(isinstance(item, str) and SOURCE_PATTERN.fullmatch(item.strip())
+                       for item in job_sources)
+            or type(auto_collect_hours) is not int or not 0 <= auto_collect_hours <= 168
+            or not isinstance(auto_process, bool)):
+        raise EvaluationError("error.sources")
     if not isinstance(api_key, str) or not isinstance(websites, list) or not all(
         isinstance(item, str) and item.strip() for item in websites
     ) or type(max_pages) is not int or not 1 <= max_pages <= 100 or not isinstance(profiles, dict):
@@ -233,6 +253,9 @@ def validate_config(value: object) -> AppConfig:
         backup_models={name: list(dict.fromkeys(model.strip() for model in models))
                        for name, models in backups.items()},
         distribute_models=distribute,
+        job_sources=list(dict.fromkeys(item.strip() for item in job_sources)),
+        auto_collect_hours=auto_collect_hours,
+        auto_process=auto_process,
     )
 
 

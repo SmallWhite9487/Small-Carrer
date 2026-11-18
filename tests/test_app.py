@@ -6,6 +6,7 @@ from pathlib import Path
 import runpy
 import string
 import tempfile
+import threading
 import tkinter as tk
 from tkinter import ttk
 from types import SimpleNamespace
@@ -14,7 +15,8 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from modules import core, crawler
-from modules.app import BatchDone, CareerApp, CrawlDone, ErrorEvent, JobEvent, PolishDone, ProgressEvent
+from modules.app import (BatchDone, CareerApp, CollectDone, CrawlDone, ErrorEvent, JobEvent,
+                         LoginDone, LoginPrompt, PolishDone, ProgressEvent)
 from modules.evaluation_page import CARD_GAP, CARD_HEIGHT, CARD_WIDTH
 from modules.i18n import LANGUAGES, MESSAGES, translate
 
@@ -41,7 +43,7 @@ class CoreTests(unittest.TestCase):
     def test_entry_and_paths(self) -> None:
         directory = Path(__file__).resolve().parent.parent
         self.assertEqual(core.app_directory(), directory)
-        with patch("modules.app.run") as run:
+        with patch("modules.app.run") as run, patch("sys.argv", ["main.py"]):
             runpy.run_path(str(directory / "main.py"), run_name="__main__")
         run.assert_called_once_with()
         with patch.object(core.sys, "frozen", True, create=True), \
@@ -333,6 +335,151 @@ class DesktopTests(unittest.TestCase):
             evaluate.assert_not_called()
             denied.assert_called_once()
 
+    def test_login_mode_prompts_and_then_collects_with_profile(self) -> None:
+        app = self.app
+        app.evaluation_page.website_entry.set("https://example.com/jobs")
+        app.evaluation_page.login_mode.set(True)
+        errors: list[Exception] = []
+
+        def run() -> None:
+            try:
+                app.wait_for_login()
+            except Exception as exc:  # surfaced to the assertion below
+                errors.append(exc)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertIsInstance(self.event(), LoginPrompt)
+        app.show_login_prompt()
+        self.root.update()
+        self.assertIsNotNone(app.login_window)
+        app.finish_login()
+        worker.join(5)
+        self.assertEqual(errors, [])
+        self.assertIsNone(app.login_window)
+        self.assertIsInstance(self.event(), LoginDone)
+        with patch("modules.app.crawl_to_queue", return_value=(0, [], False, False)) as crawl:
+            app.evaluation_page.buttons["start"].invoke()
+            self.assertIsInstance(self.event(), CrawlDone)
+        kwargs = crawl.call_args.kwargs
+        self.assertTrue(kwargs["browser"])
+        self.assertTrue(kwargs["profile"])
+        self.assertEqual(kwargs["login_url"], "https://example.com/")
+        self.assertEqual(kwargs["wait_login"], app.wait_for_login)
+
+    def test_login_wait_keeps_app_usable_until_it_finishes(self) -> None:
+        app = self.app
+        page = app.evaluation_page
+        page.website_entry.set("https://example.com/jobs")
+        page.login_mode.set(True)
+        with patch("modules.app.crawl_to_queue", return_value=(0, [], False, False)):
+            page.buttons["start"].invoke()
+            self.assertTrue(app.waiting_login)
+            self.assertFalse(app.running)
+            self.assertEqual(app.activity, "login")
+            self.assertEqual(str(page.buttons["start"].state()), "('disabled',)")
+            self.assertIn("disabled", page.buttons["auto_run"].state())
+            self.assertNotIn("disabled", page.buttons["stop_crawl"].state())
+            self.assertNotIn("disabled", page.buttons["process_jobs"].state())
+            self.assertEqual(str(app.settings_page.key_entry.cget("state")), "normal")
+            with patch("modules.app.messagebox.showinfo") as info:
+                app.process()
+                info.assert_called_once()
+            self.assertFalse(app.running)
+            app.on_login_done()
+            self.assertFalse(app.waiting_login)
+            self.assertTrue(app.running)
+            self.assertEqual(app.activity, "crawl")
+            self.assertNotIn("disabled", page.buttons["stop_crawl"].state())
+            self.assertIn("disabled", page.buttons["process_jobs"].state())
+
+    def test_stop_during_login_wait_cancels_instead_of_hanging(self) -> None:
+        app = self.app
+        app.evaluation_page.website_entry.set("https://example.com/jobs")
+        app.evaluation_page.login_mode.set(True)
+        with patch("modules.app.crawl_to_queue", return_value=(0, [], False, False)):
+            app.evaluation_page.buttons["start"].invoke()
+            self.assertTrue(app.waiting_login)
+            app.stop_crawl()
+            self.assertTrue(app.stop_event.is_set())
+        app.on_login_done()
+        self.assertFalse(app.waiting_login)
+        self.assertFalse(app.running)
+        self.assertNotIn("disabled", app.evaluation_page.buttons["start"].state())
+
+    def test_login_prompt_without_answer_times_out(self) -> None:
+        app = self.app
+        with patch("threading.Event.wait", return_value=False), \
+                self.assertRaises(core.EvaluationError):
+            app.wait_for_login()
+        self.assertIsInstance(self.event(), LoginPrompt)
+        self.assertIsInstance(self.event(), LoginDone)
+
+    def test_login_auto_continues_when_page_leaves_sign_in(self) -> None:
+        app = self.app
+        worker = threading.Thread(target=app.wait_for_login, args=(lambda: True,))
+        worker.start()
+        self.assertEqual(self.event(), LoginPrompt())
+        progress = self.event()
+        self.assertIsInstance(progress, ProgressEvent)
+        self.assertEqual(app.language, "zh-TW")
+        self.assertIn("登入", progress.text)
+        self.assertEqual(self.event(), LoginDone())
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+
+    def test_login_stops_when_browser_closes(self) -> None:
+        app = self.app
+        errors: list[Exception] = []
+
+        def probe() -> bool:
+            raise core.EvaluationError("error.browser_closed")
+
+        def run() -> None:
+            try:
+                app.wait_for_login(probe)
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertIsInstance(self.event(), LoginPrompt)
+        worker.join(5)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], core.EvaluationError)
+        self.assertIsInstance(self.event(), LoginDone)
+
+    def test_scheduler_only_runs_when_interval_elapsed(self) -> None:
+        app = self.app
+        app.config["job_sources"] = ["greenhouse:acme"]
+        app.config["auto_collect_hours"] = 1
+        clock = self.path / "last_collect.txt"
+        with patch.object(app, "collect_sources") as run, \
+                patch("modules.app.time", return_value=10_000.0):
+            clock.write_text("9000.0\n", encoding="ascii")
+            app.schedule_collect()
+            run.assert_not_called()
+            clock.write_text("1000.0\n", encoding="ascii")
+            app.schedule_collect()
+            run.assert_called_once_with(scheduled=True)
+
+    def test_collect_sources_queues_from_configured_sources(self) -> None:
+        app = self.app
+        app.settings_page.sources.insert("1.0", "greenhouse:acme")
+        app.save()
+        with patch("modules.app.collect", return_value=(2, [])) as collect, \
+                patch("modules.app.messagebox.showinfo") as info:
+            app.evaluation_page.buttons["collect_sources"].invoke()
+            event = self.event()
+            self.assertIsInstance(event, CollectDone)
+            self.assertEqual((event.saved, event.processed, event.scheduled), (2, 0, False))
+            app.events.put(event)
+            app.poll()
+        collect.assert_called_once()
+        self.assertEqual(collect.call_args.args[0], ["greenhouse:acme"])
+        info.assert_called_once()
+        self.assertIn("2", app.evaluation_page.status.get())
+
     def test_provider_tabs_ignore_wheel_and_preserve_drafts_on_language_change(self) -> None:
         settings = self.app.settings_page
         self.assertFalse(hasattr(settings, "provider_box"))
@@ -430,65 +577,9 @@ class DesktopTests(unittest.TestCase):
         app.home_page.evaluation_button.invoke()
         self.assertEqual(app.current_page, "evaluation")
         self.assertEqual(set(app.evaluation_page.buttons),
-                         {"start", "save_site", "remove_site", "stop_crawl", "process_jobs", "auto_run",
-                          "open_linkedin", "import_linkedin"})
+                         {"start", "save_site", "remove_site", "stop_crawl", "process_jobs",
+                          "auto_run", "collect_sources", "capture"})
         self.assertEqual(app.evaluation_page.website_label.cget("text"), "招聘網站搜尋結果網址")
-
-    def test_linkedin_button_opens_jobs_without_starting_crawl(self) -> None:
-        app = self.app
-        app.evaluation_page.website_entry.set("https://example.com/jobs")
-        button = app.evaluation_page.buttons["open_linkedin"]
-        with patch("modules.app.webbrowser.open_new_tab", return_value=True) as browser, \
-                patch("modules.app.crawl_to_queue") as crawl:
-            button.invoke()
-        browser.assert_called_once_with("https://www.linkedin.com/jobs/")
-        crawl.assert_not_called()
-        self.assertFalse(app.running)
-        self.assertFalse((self.path / "config.json").exists())
-
-    def test_linkedin_paste_dialog_queues_locally_and_deduplicates_job_links(self) -> None:
-        self.root.deiconify()
-        self.app.show_page("evaluation")
-        self.root.update()
-        with patch("modules.app.crawl_to_queue") as crawl, \
-                patch("modules.app.process_pending") as process, \
-                patch("modules.app.webbrowser.open_new_tab") as browser:
-            self.app.evaluation_page.buttons["import_linkedin"].invoke()
-            dialog = next(window for window in self.root.winfo_children()
-                          if isinstance(window, tk.Toplevel))
-            dialog.url.insert(0, "https://uk.linkedin.com/jobs/view/analyst-12345/?trackingId=demo")
-            dialog.content.insert("1.0", "Analyst\nRemote within the United States")
-            dialog.submit.invoke()
-            self.assertFalse(dialog.winfo_exists())
-            self.assertTrue(self.app.import_linkedin_job(
-                "https://www.linkedin.com/jobs/view/12345/#detail",
-                "Analyst\nRemote within the United States"))
-            crawl.assert_not_called()
-            process.assert_not_called()
-            browser.assert_not_called()
-        self.assertEqual(self.app.evaluation_page.pending, 1)
-        connection = core.open_database(self.path / "jobs.sqlite3")
-        try:
-            self.assertEqual(connection.execute(
-                "SELECT source, content, status FROM pending_jobs").fetchall(),
-                [("https://www.linkedin.com/jobs/view/12345/",
-                  "Analyst\nRemote within the United States", "pending")])
-        finally:
-            connection.close()
-
-    def test_linkedin_paste_rejects_non_job_urls_and_invalid_text(self) -> None:
-        job_url = "https://www.linkedin.com/jobs/view/12345/"
-        for url, content in (
-            ("https://www.linkedin.com/jobs/search/?currentJobId=12345", "Analyst"),
-            ("https://www.linkedin.com.example.com/jobs/view/12345/", "Analyst"),
-            (job_url, " \n"),
-            (job_url, "a" * 30_001),
-        ):
-            with self.subTest(url=url, size=len(content)), \
-                    patch("modules.app.messagebox.showerror") as error:
-                self.assertFalse(self.app.import_linkedin_job(url, content))
-                error.assert_called_once()
-        self.assertFalse((self.path / "jobs.sqlite3").exists())
 
     def test_model_menu_refreshes_in_background_and_throttles_reopening(self) -> None:
         app = self.app
@@ -559,18 +650,6 @@ class DesktopTests(unittest.TestCase):
             fetch.assert_called_once()
             error.assert_not_called()
             self.assertEqual(settings.model_menu.index("end"), initial_choices)
-
-    def test_linkedin_button_shows_error_when_browser_cannot_open(self) -> None:
-        self.app.change_language("en")
-        button = self.app.evaluation_page.buttons["open_linkedin"]
-        for outcome in (False, OSError("no browser")):
-            with self.subTest(outcome=outcome), \
-                    patch("modules.app.webbrowser.open_new_tab", side_effect=[outcome]), \
-                    patch("modules.app.messagebox.showerror") as error:
-                button.invoke()
-            error.assert_called_once()
-            self.assertEqual(error.call_args.args[0], "Open LinkedIn Jobs in browser")
-            self.assertIn("https://www.linkedin.com/jobs/", error.call_args.args[1])
 
     def test_masked_key_copy_and_paste(self) -> None:
         self.root.deiconify()

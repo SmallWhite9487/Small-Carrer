@@ -2,6 +2,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -99,6 +100,43 @@ setTimeout(() => {
         self.assertEqual(error.exception.key, "error.website_forbidden")
         self.assertEqual(error.exception.values["stage"], "Chromium")
         client.page.goto.assert_called_once()
+
+
+class LoginReadyTests(unittest.TestCase):
+    def crawler(self, url="https://example.com/jobs", *, password=False, closed=False,
+                elapsed=10.0, page=True):
+        client = BrowserCrawler("https://example.com/jobs")
+        if not page:
+            return client
+        view = Mock()
+        view.url = url
+        view.is_closed.return_value = closed
+        view.context.browser.is_connected.return_value = not closed
+        frame = Mock()
+        frame.locator.return_value.count.return_value = 1 if password else 0
+        view.frames = [frame]
+        client.page = view
+        client.login_started = time.monotonic() - elapsed
+        return client
+
+    def test_ready_only_after_dwell(self) -> None:
+        self.assertFalse(self.crawler(elapsed=0).login_ready())
+        self.assertTrue(self.crawler(elapsed=60).login_ready())
+
+    def test_sign_in_page_or_password_box_keeps_waiting(self) -> None:
+        for url in ("https://example.com/login", "https://example.com/users/sign-in",
+                    "https://accounts.example.com/o/sso/start", "https://example.com/checkpoint",
+                    "about:blank"):
+            with self.subTest(url=url):
+                self.assertFalse(self.crawler(url, elapsed=60).login_ready())
+        self.assertFalse(self.crawler(password=True, elapsed=60).login_ready())
+
+    def test_closed_browser_stops_the_wait(self) -> None:
+        with self.assertRaises(core.EvaluationError) as error:
+            self.crawler(closed=True).login_ready()
+        self.assertEqual(error.exception.key, "error.browser_closed")
+        with self.assertRaises(core.EvaluationError):
+            self.crawler(page=False).login_ready()
 
 
 if __name__ == "__main__":

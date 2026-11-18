@@ -8,25 +8,27 @@ import queue
 import re
 import sqlite3
 import threading
-from time import monotonic
+from time import monotonic, time
 import tkinter as tk
 from tkinter import messagebox, ttk
+from typing import Callable
 from urllib.parse import urlsplit
-import webbrowser
 
 from .activity_log import ActivityLog, development_console
+from .capture import CaptureServer, import_text
 from .core import (
-    AppConfig, EvaluationError, MODEL_CATALOG_ENDPOINTS, fetch_model_catalog, load_config,
-    JobRecord, load_jobs, open_database, pending_count, polish_requirements,
+    AppConfig, EvaluationError, MODEL_CATALOG_ENDPOINTS, atomic_write, fetch_model_catalog,
+    load_config, JobRecord, load_jobs, open_database, pending_count, polish_requirements,
     process_pending, reset_database, save_config, save_pending, validate_config,
 )
 from .crawler import crawl_to_queue, normalize_url
 from .data_paths import prepare_data_directory
-from .evaluation_page import EvaluationPage, LinkedInImportDialog
+from .evaluation_page import CaptureDialog, EvaluationPage
 from .home_page import HomePage
 from .i18n import Language, translate
 from .settings_page import RequirementsPreview, SettingsPage
-from .ui import configure_style
+from .sources import collect
+from .ui import configure_style, configure_window_icon
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,25 @@ class CrawlDone:
 
 
 @dataclass(frozen=True)
+class CollectDone:
+    saved: int
+    failures: list[str]
+    stopped: bool
+    processed: int = 0
+    scheduled: bool = False
+
+
+@dataclass(frozen=True)
+class LoginPrompt:
+    pass
+
+
+@dataclass(frozen=True)
+class LoginDone:
+    pass
+
+
+@dataclass(frozen=True)
 class ErrorEvent:
     title: str
     detail: str
@@ -76,7 +97,10 @@ class ErrorEvent:
     log_detail: str = ""
 
 
-AppEvent = ProgressEvent | JobEvent | BatchDone | CrawlDone | PolishDone | CatalogDone | ErrorEvent
+AppEvent = (ProgressEvent | JobEvent | BatchDone | CrawlDone | PolishDone | CatalogDone
+            | CollectDone | LoginPrompt | LoginDone | ErrorEvent)
+
+LOGIN_TIMEOUT = 600  # seconds the sign-in window may stay open
 
 
 class CareerApp:
@@ -87,12 +111,20 @@ class CareerApp:
         self.config = load_config(directory / "config.json")
         self.language = self.config["language"]
         self.running = False
+        self.waiting_login = False
+        self.pending_activity = ""
+        self.login_started = 0.0
+        self.login_tick = -1
         self.stop_event = threading.Event()
         self.activity = ""
         self.events: queue.Queue[AppEvent] = queue.Queue()
         self.catalog_attempts: dict[str, tuple[tuple[str, bytes], float]] = {}
         self.catalog_pending: set[str] = set()
         self.preview: RequirementsPreview | None = None
+        self.login_event = threading.Event()
+        self.login_window: tk.Toplevel | None = None
+        self.capture = CaptureServer(directory)
+        self.capture.start()
         root.geometry("1180x820")
         root.minsize(980, 650)
         configure_style(root)
@@ -133,9 +165,7 @@ class CareerApp:
             self.process, self.save_site, self.remove_site,
             lambda category: self.log("INFO", "log_filter", category=self.text(
                 "filter_all" if category == "all" else category)),
-            lambda: self.start(auto=True),
-            self.open_linkedin,
-            self.open_linkedin_import,
+            lambda: self.start(auto=True), self.collect_sources, self.open_capture,
         )
         self.evaluation_page.website_entry.configure(values=self.config["websites"])
         if self.config["websites"]:
@@ -160,11 +190,14 @@ class CareerApp:
         self.reload_jobs()
         self.refresh_pending()
         self.poll_id = root.after(100, self.poll)
+        self.schedule_id = root.after(60_000, self.schedule_collect)
         root.bind("<Destroy>", self.on_destroy, add="+")
 
     def on_destroy(self, event: tk.Event) -> None:
         if event.widget == self.root:
             self.root.after_cancel(self.poll_id)
+            self.root.after_cancel(self.schedule_id)
+            self.capture.close()
             self.log("INFO", "log_closed")
             if self.activity_log is not None:
                 self.activity_log.close()
@@ -292,7 +325,7 @@ class CareerApp:
         self.running = busy
         self.activity = activity if busy else ""
         self.settings_page.set_busy(busy)
-        self.evaluation_page.set_busy(busy, activity in ("crawl", "auto"))
+        self.evaluation_page.set_busy(busy, activity in ("crawl", "auto", "sources"))
         self.language_button.state(["disabled"] if busy else ["!disabled"])
 
     def refresh_pending(self) -> None:
@@ -325,54 +358,6 @@ class CareerApp:
         self.evaluation_page.website_entry.set(url)
         self.evaluation_page.set_status("site_saved")
         self.log("INFO", "site_saved")
-
-    def open_linkedin(self) -> None:
-        try:
-            opened = webbrowser.open_new_tab("https://www.linkedin.com/jobs/")
-        except (OSError, webbrowser.Error):
-            opened = False
-        if not opened:
-            self.show_error("open_linkedin", EvaluationError("error.open_linkedin"))
-            return
-        self.log("INFO", "linkedin_opened")
-
-    def open_linkedin_import(self) -> None:
-        if not self.running:
-            LinkedInImportDialog(self.root, self.language, self.import_linkedin_job)
-
-    def import_linkedin_job(self, url: str, content: str) -> bool:
-        if self.running:
-            self.show_error("import_linkedin", EvaluationError(self.text("wait_close")))
-            return False
-        try:
-            try:
-                parts = urlsplit(normalize_url(url))
-            except EvaluationError as exc:
-                raise EvaluationError("error.linkedin_job_url") from exc
-            host = parts.hostname or ""
-            match = re.fullmatch(r"/jobs/view/(?:[^/]+-)?([0-9]+)/?", parts.path)
-            if (parts.scheme != "https" or parts.port not in (None, 443) or not match
-                    or not (host == "linkedin.com" or host.endswith(".linkedin.com"))):
-                raise EvaluationError("error.linkedin_job_url")
-            source = f"https://www.linkedin.com/jobs/view/{match[1]}/"
-            content = content.strip()
-            if not content:
-                raise EvaluationError("error.empty_markdown")
-            if len(content) > 30_000:
-                raise EvaluationError("error.linkedin_job_size")
-            connection = open_database(self.directory / "jobs.sqlite3")
-            try:
-                changed = save_pending(connection, source, content)
-            finally:
-                connection.close()
-        except (EvaluationError, OSError, sqlite3.Error) as exc:
-            self.show_error("import_linkedin", exc)
-            return False
-        self.refresh_pending()
-        key = "linkedin_imported" if changed else "job_unchanged"
-        self.evaluation_page.set_status(key)
-        self.log("INFO", key)
-        return True
 
     def remove_site(self) -> None:
         url = self.evaluation_page.website_entry.get().strip()
@@ -537,6 +522,10 @@ class CareerApp:
     def start(self, *, auto: bool = False) -> None:
         if self.running:
             return
+        if self.waiting_login:
+            messagebox.showinfo(self.text("login_waiting_title"),
+                                self.text("login_waiting_busy"), parent=self.root)
+            return
         website = self.evaluation_page.website_entry.get().strip()
         if not website:
             self.log("ERROR", "log_error", action=self.text("cannot_start"), error="error.website_url")
@@ -589,11 +578,28 @@ class CareerApp:
             else:
                 self.log("INFO", "ai_crawl_rules_only")
         self.stop_event.clear()
-        self.set_busy(True, "auto" if auto else "crawl")
-        self.evaluation_page.set_status("finding_jobs")
-        self.log("INFO", "finding_jobs")
-        self.show_page("evaluation")
         use_browser = self.evaluation_page.use_browser.get()
+        login_mode = self.evaluation_page.login_mode.get()
+        if login_mode:
+            use_browser = True
+        activity = "auto" if auto else "crawl"
+        self.pending_activity = activity
+        if login_mode:
+            # Signing in may take minutes and may never happen. Keep the rest of
+            # the app usable instead of disabling everything until the browser
+            # leaves the sign-in form; only Start waits for this attempt.
+            self.waiting_login = True
+            self.activity = "login"
+            self.login_started = monotonic()
+            self.login_tick = -1
+            self.evaluation_page.set_waiting_login(True)
+            self.evaluation_page.set_status("login_waiting")
+            self.log("INFO", "login_waiting")
+        else:
+            self.set_busy(True, activity)
+            self.evaluation_page.set_status("finding_jobs")
+            self.log("INFO", "finding_jobs")
+        self.show_page("evaluation")
         if use_browser:
             self.log("INFO", "use_browser")
 
@@ -601,8 +607,12 @@ class CareerApp:
             try:
                 args = (website, self.directory, self.language, max_pages,
                         self.stop_event, lambda text: self.events.put(ProgressEvent(text)))
+                site = f"{urlsplit(website).scheme}://{urlsplit(website).netloc}/"
                 if use_browser:
-                    result = crawl_to_queue(*args, ai_config=ai_config, ai_key=ai_key, browser=True)
+                    result = crawl_to_queue(*args, ai_config=ai_config, ai_key=ai_key, browser=True,
+                                            profile=login_mode,
+                                            login_url=site if login_mode else None,
+                                            wait_login=self.wait_for_login if login_mode else None)
                 elif ai_config is None:
                     result = crawl_to_queue(*args)
                 else:
@@ -621,19 +631,205 @@ class CareerApp:
                         self.events.put(BatchDone(saved, [*result[1], *failures], stopped))
                         return
                 self.events.put(CrawlDone(*result))
-            except (EvaluationError, OSError, UnicodeError, sqlite3.Error) as exc:
+            except EvaluationError as exc:
+                if exc.key == "error.stopped":
+                    # Cancelling during the sign-in wait is not a failure.
+                    self.events.put(CrawlDone(0, [], True, False))
+                else:
+                    self.events.put(self.worker_error("processing_failed", exc))
+            except (OSError, UnicodeError, sqlite3.Error) as exc:
                 self.events.put(self.worker_error("processing_failed", exc))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def stop_crawl(self) -> None:
-        if self.running and self.activity in ("crawl", "auto"):
+        if self.waiting_login:
+            self.stop_event.set()
+            self.log("INFO", "log_stop_requested")
+            self.evaluation_page.buttons["stop_crawl"].state(["disabled"])
+            return
+        if self.running and self.activity in ("crawl", "auto", "sources"):
             self.stop_event.set()
             self.log("INFO", "log_stop_requested")
             self.evaluation_page.buttons["stop_crawl"].state(["disabled"])
 
+    def open_capture(self) -> None:
+        if self.running:
+            return
+        CaptureDialog(self.root, self.language, self.capture.snippet(), self.import_capture)
+
+    def import_capture(self, text: str) -> tuple[bool, str, str]:
+        ok, title, key = import_text(self.capture, text)
+        if ok:
+            self.refresh_pending()
+            self.evaluation_page.set_status(key, title=title)
+            self.log("INFO", key, title=title)
+        return ok, title, key
+
+    def wait_for_login(self, probe: Callable[[], bool] | None = None) -> None:
+        """Wait for sign-in, then continue without another click.
+
+        The browser is watched twice per second: once the page leaves the
+        sign-in flow for two consecutive checks, collection resumes by itself.
+        The dialog stays available for sites whose redirect never satisfies
+        the probe, and closing the browser stops the wait immediately.
+        """
+        self.login_event.clear()
+        self.events.put(LoginPrompt())
+        ready = 0
+        finished = False
+        try:
+            for _ in range(LOGIN_TIMEOUT):
+                if self.login_event.wait(1):
+                    finished = True
+                    break
+                if self.stop_event.is_set():
+                    break
+                if probe is not None and probe():
+                    ready += 1
+                    if ready >= 2:
+                        self.events.put(ProgressEvent(self.text("login_detected")))
+                        finished = True
+                        break
+                else:
+                    ready = 0
+        finally:
+            self.events.put(LoginDone())
+        if self.stop_event.is_set():
+            raise EvaluationError("error.stopped")
+        if not finished:
+            raise EvaluationError("error.login_timeout")
+
+    def show_login_prompt(self) -> None:
+        if self.login_window is not None:
+            return
+        window = tk.Toplevel(self.root)
+        configure_window_icon(window)
+        window.title(self.text("login_prompt_title"))
+        window.transient(self.root)
+        window.geometry("540x270")
+        window.protocol("WM_DELETE_WINDOW", self.finish_login)
+        panel = ttk.Frame(window, padding=20)
+        panel.pack(fill="both", expand=True)
+        ttk.Label(panel, text=self.text("login_prompt_hint"), wraplength=480,
+                  justify="left").pack(anchor="w", pady=(0, 16))
+        ttk.Button(panel, text=self.text("login_done"), style="Accent.TButton",
+                   command=self.finish_login).pack(anchor="w")
+        ttk.Button(panel, text=self.text("cancel"), command=self.cancel_login).pack(
+            anchor="w", pady=(8, 0))
+        window.attributes("-topmost", True)
+        window.lift()
+        window.focus_force()
+        window.bind("<Return>", lambda event: self.finish_login())
+        self.login_window = window
+        self.log("INFO", "login_prompt_title")
+
+    def close_login_prompt(self) -> None:
+        if self.login_window is not None:
+            self.login_window.destroy()
+            self.login_window = None
+
+    def finish_login(self) -> None:
+        self.close_login_prompt()
+        self.login_event.set()
+
+    def on_login_done(self) -> None:
+        """Leave the wait state and lock the app for the collection that follows."""
+        self.close_login_prompt()
+        if not self.waiting_login:
+            return
+        self.waiting_login = False
+        if self.stop_event.is_set():
+            self.evaluation_page.set_waiting_login(False)
+            return
+        self.set_busy(True, self.pending_activity)
+        self.evaluation_page.set_status("finding_jobs")
+        self.log("INFO", "finding_jobs")
+
+    def cancel_login(self) -> None:
+        self.stop_event.set()
+        self.finish_login()
+
+    def last_collect_time(self) -> float:
+        try:
+            return float((self.directory / "last_collect.txt").read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            return 0.0
+
+    def mark_collected(self) -> None:
+        try:
+            atomic_write(self.directory / "last_collect.txt",
+                         lambda target: target.write_text(f"{time():.0f}\n", encoding="ascii"))
+        except OSError as exc:
+            self.log("ERROR", "log_error", action="auto_collect", error=type(exc).__name__)
+
+    def schedule_collect(self) -> None:
+        self.schedule_id = self.root.after(60_000, self.schedule_collect)
+        if self.running or self.config["auto_collect_hours"] <= 0 or not self.config["job_sources"]:
+            return
+        last = self.last_collect_time()
+        if not last:
+            # Start the clock on first launch; the manual button or the next
+            # interval of this same session performs the first run.
+            self.mark_collected()
+            return
+        if time() - last >= self.config["auto_collect_hours"] * 3600:
+            self.collect_sources(scheduled=True)
+
+    def collect_sources(self, scheduled: bool = False) -> None:
+        if self.running or self.waiting_login:
+            return
+        try:
+            config = self.read_config()
+        except (EvaluationError, OSError) as exc:
+            if not scheduled:
+                self.show_error("cannot_start", exc)
+            return
+        if not config["job_sources"]:
+            if not scheduled:
+                self.show_error("cannot_start", EvaluationError("error.no_sources"))
+            return
+        key = self.api_key(config) if config["auto_process"] else ""
+        self.stop_event.clear()
+        self.set_busy(True, "sources")
+        self.evaluation_page.set_status("finding_jobs")
+        self.log("INFO", "finding_jobs")
+        self.show_page("evaluation")
+
+        def worker() -> None:
+            try:
+                saved, failures = collect(
+                    config["job_sources"], self.directory, config["language"], self.stop_event,
+                    lambda text: self.events.put(ProgressEvent(text)))
+                processed = 0
+                if scheduled and key and not self.stop_event.is_set():
+                    connection = open_database(self.directory / "jobs.sqlite3")
+                    try:
+                        has_pending = pending_count(connection) > 0
+                    finally:
+                        connection.close()
+                    if has_pending:
+                        processed, eval_failures, stopped = process_pending(
+                            config, key, self.directory, self.stop_event,
+                            lambda text: self.events.put(ProgressEvent(text)),
+                            lambda job: self.events.put(JobEvent(job)))
+                        failures = [*failures, *eval_failures]
+                    else:
+                        stopped = False
+                else:
+                    stopped = self.stop_event.is_set()
+                self.events.put(CollectDone(saved, failures, stopped, processed, scheduled))
+            except (EvaluationError, OSError, UnicodeError, sqlite3.Error) as exc:
+                self.events.put(self.worker_error("processing_failed", exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def process(self) -> None:
         if self.running:
+            return
+        if self.waiting_login:
+            messagebox.showinfo(self.text("login_waiting_title"),
+                                self.text("login_waiting_busy"), parent=self.root)
             return
         try:
             config = self.read_config()
@@ -679,6 +875,13 @@ class CareerApp:
 
     def poll(self) -> None:
         self.root.after_cancel(self.poll_id)
+        if self.capture.drain():
+            self.refresh_pending()
+        if self.waiting_login:
+            elapsed = int(monotonic() - self.login_started)
+            if elapsed != self.login_tick:
+                self.login_tick = elapsed
+                self.evaluation_page.set_status("login_waiting_time", seconds=elapsed)
         while True:
             try:
                 event = self.events.get_nowait()
@@ -700,6 +903,12 @@ class CareerApp:
                 continue
             if isinstance(event, CatalogDone):
                 self.finish_catalog(event)
+                continue
+            if isinstance(event, LoginPrompt):
+                self.show_login_prompt()
+                continue
+            if isinstance(event, LoginDone):
+                self.on_login_done()
                 continue
             self.set_busy(False)
             self.refresh_pending()
@@ -724,6 +933,25 @@ class CareerApp:
                 else:
                     messagebox.showinfo(self.text("complete"), self.text("complete_message", saved=saved) + notice,
                                         parent=self.root)
+            elif isinstance(event, CollectDone):
+                self.mark_collected()
+                text = self.text("collect_complete", saved=event.saved,
+                                 pending=self.evaluation_page.pending)
+                if event.processed:
+                    text += "\n" + self.text("processed_count", count=event.processed)
+                if event.stopped:
+                    text += "\n" + self.text("processing_stopped")
+                if event.failures:
+                    text += "\n\n" + "\n".join(event.failures)
+                self.evaluation_page.status.set(text)
+                self.log("ERROR" if event.failures else "INFO", "collect_complete",
+                         saved=event.saved, pending=self.evaluation_page.pending)
+                if event.failures:
+                    self.log_failures(event.failures)
+                if not event.scheduled:
+                    show = messagebox.showerror if event.failures else messagebox.showinfo
+                    show(self.text("partial_failure" if event.failures else "complete"),
+                         text, parent=self.root)
             elif isinstance(event, CrawlDone):
                 key = "crawl_stopped" if event.stopped else "crawl_complete"
                 text = self.text(key, saved=event.saved, pending=self.evaluation_page.pending)
@@ -743,7 +971,11 @@ class CareerApp:
         self.poll_id = self.root.after(100, self.poll)
 
     def close(self) -> None:
-        if self.running:
+        if self.waiting_login:
+            # Stop the background browser first, then let it close cleanly.
+            self.stop_event.set()
+            self.root.after(1200, self.root.destroy)
+        elif self.running:
             messagebox.showwarning(self.text("busy"), self.text("wait_close"), parent=self.root)
         else:
             self.root.destroy()

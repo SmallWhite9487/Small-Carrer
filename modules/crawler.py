@@ -26,6 +26,10 @@ MAX_JOBS = 20
 MAX_BYTES = 3_000_000
 TIMEOUT = 20
 DELAY = 1.0
+# Some sites ask crawlers to wait 30-60s between requests. This is a desktop
+# tool fetching a handful of pages for one person, so honour crawl-delay but
+# cap it; otherwise every page turn looks frozen.
+MAX_DELAY = 5.0
 PageResult = TypeVar("PageResult")
 
 
@@ -321,7 +325,7 @@ class Crawler:
         parser.set_url(robots_url)
         parser.parse(raw.splitlines())
         self.robots = parser
-        self.delay = max(DELAY, float(parser.crawl_delay(USER_AGENT) or 0))
+        self.delay = min(MAX_DELAY, max(DELAY, float(parser.crawl_delay(USER_AGENT) or 0)))
 
     def listing(self) -> Listing:
         self.prepare()
@@ -340,13 +344,16 @@ def crawl_to_queue(
     website: str, directory: Path, language: Language, max_pages: int,
     stop: threading.Event, progress: Callable[[str], None],
     *, ai_config: AppConfig | None = None, ai_key: str = "", browser: bool = False,
+    profile: bool = False, login_url: str | None = None,
+    wait_login: Callable[[Callable[[], bool]], None] | None = None,
 ) -> tuple[int, list[str], bool, bool]:
     from .ai_browse import analyze_detail, analyze_listing
 
     if browser:
         from .browser_crawler import BrowserCrawler
 
-        crawler = BrowserCrawler(website, stop, directory=directory)
+        crawler = BrowserCrawler(website, stop, directory=directory, profile=profile,
+                                 login_url=login_url, wait_login=wait_login)
     else:
         crawler = Crawler(website, stop)
     connection = open_database(directory / "jobs.sqlite3")
