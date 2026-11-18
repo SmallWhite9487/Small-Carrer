@@ -1,1 +1,2 @@
 playwright>=1.56,<2
+certifi; sys_platform == "darwin"

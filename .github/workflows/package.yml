@@ -1,0 +1,58 @@
+name: Package Small Career
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Expected commit SHA (leave blank when launching from the Actions page)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            artifact: Windows-x64
+            file: packing/dist/SmallCareer.exe
+          - runner: macos-15
+            artifact: macOS-arm64
+            file: packing/dist/SmallCareer-macOS-arm64.zip
+          - runner: macos-15-intel
+            artifact: macOS-x86_64
+            file: packing/dist/SmallCareer-macOS-x86_64.zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Verify the selected revision
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          if [[ -n "$EXPECTED_COMMIT" && "$EXPECTED_COMMIT" != "$GITHUB_SHA" ]]; then
+            echo "Branch moved before dispatch. Run the package command again."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build Windows EXE
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call packing\build.cmd --windows-only --no-pause
+      - name: Build macOS application
+        if: runner.os == 'macOS'
+        run: bash packing/build-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SmallCareer-${{ matrix.artifact }}
+          path: ${{ matrix.file }}
+          if-no-files-found: error
+          compression-level: 0

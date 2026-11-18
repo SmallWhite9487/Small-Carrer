@@ -8,14 +8,14 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.robotparser import RobotFileParser
 
 from .core import (
-    AppConfig, EvaluationError, JobRecord, export_csv, open_database,
+    AppConfig, EvaluationError, JobRecord, configured_models, open_database,
     request_evaluation, save_pending, store_job,
 )
 from .i18n import Language, translate
@@ -26,6 +26,33 @@ MAX_JOBS = 20
 MAX_BYTES = 3_000_000
 TIMEOUT = 20
 DELAY = 1.0
+PageResult = TypeVar("PageResult")
+
+
+def is_transient_ai_error(error: EvaluationError) -> bool:
+    code = error.values.get("code")
+    return error.key == "error.network" or (
+        error.key == "error.http" and isinstance(code, int)
+        and (code == 429 or 500 <= code < 600)
+    )
+
+
+def analyze_with_backup(
+    analyze: Callable[[AppConfig], PageResult], config: AppConfig, language: Language,
+    stop: threading.Event, progress: Callable[[str], None],
+) -> PageResult:
+    models = configured_models(config)
+    for index, model in enumerate(models):
+        if stop.is_set():
+            raise EvaluationError("error.stopped")
+        try:
+            return analyze({**config, "model": model})
+        except EvaluationError as exc:
+            if stop.is_set() or index + 1 == len(models) or not is_transient_ai_error(exc):
+                raise
+            progress(translate(language, "model_fallback", current=model,
+                               next_model=models[index + 1], error=exc.localized(language)))
+    raise EvaluationError("error.config_extras")
 
 
 @dataclass(frozen=True)
@@ -139,6 +166,13 @@ def documents(parser: DocumentParser) -> Iterator[dict]:
         yield from structured_objects(value)
 
 
+def is_job_detail_candidate(url: str) -> bool:
+    parts = urlsplit(url)
+    if parts.hostname in ("www.linkedin.com", "linkedin.com"):
+        return bool(re.fullmatch(r"/jobs/view/[^/]+/?", parts.path))
+    return True
+
+
 def listing_links(html: str, base_url: str, limit: int | None = MAX_JOBS) -> Listing:
     parser = DocumentParser()
     parser.feed(html)
@@ -170,7 +204,8 @@ def listing_links(html: str, base_url: str, limit: int | None = MAX_JOBS) -> Lis
             link = normalize_url(urljoin(base_url, candidate))
         except EvaluationError:
             continue
-        if origin(link) == origin(base_url) and link != base_url and link not in seen:
+        if (origin(link) == origin(base_url) and link != base_url and link not in seen
+                and is_job_detail_candidate(link)):
             links.append(link)
             seen.add(link)
     if limit is None:
@@ -232,8 +267,8 @@ class Crawler:
             url = normalize_url(url)
             if origin(url) != self.site:
                 raise EvaluationError("error.website_redirect")
-            if not robots and (self.robots is None or not self.robots.can_fetch(USER_AGENT, url)):
-                raise EvaluationError("error.robots_denied")
+            #if not robots and (self.robots is None or not self.robots.can_fetch(USER_AGENT, url)):
+            #    raise EvaluationError("error.robots_denied")
             wait = self.delay - (time.monotonic() - self.last_request)
             if wait > 0:
                 if self.stop is not None:
@@ -268,6 +303,9 @@ class Crawler:
                     if exc.code == 403:
                         raise EvaluationError(
                             "error.website_forbidden", stage="robots.txt" if robots else "HTML") from exc
+                    if exc.code == 429:
+                        raise EvaluationError(
+                            "error.website_rate_limit", stage="robots.txt" if robots else "HTML") from exc
                     raise EvaluationError("error.website_http", code=exc.code) from exc
                 finally:
                     exc.close()
@@ -353,11 +391,24 @@ def crawl_to_queue(
             following = next_page(html, final_url)
             if ai_config is not None and (not listing.links or following is None):
                 progress(translate(language, "ai_analyzing_page"))
-                ai_links, ai_next = analyze_listing(html, final_url, ai_config, ai_key)
+                try:
+                    ai_links, ai_next = analyze_with_backup(
+                        lambda config: analyze_listing(html, final_url, config, ai_key),
+                        ai_config, language, stop, progress)
+                except EvaluationError as exc:
+                    if not listing.links or not is_transient_ai_error(exc):
+                        raise
+                    failures.append(f"{final_url}: {exc.localized(language)}")
+                    progress(translate(language, "ai_listing_unavailable", error=exc.localized(language)))
+                    ai_links, ai_next = [], None
                 if stop.is_set():
                     break
                 if not listing.links:
-                    listing = Listing(ai_links, False)
+                    listing = Listing([link for link in ai_links if is_job_detail_candidate(link)], False)
+                    if not listing.links:
+                        if ai_links:
+                            raise EvaluationError("error.ai_job_links_rejected", count=len(ai_links))
+                        raise EvaluationError("error.ai_no_job_links")
                 if following is None:
                     following = ai_next
             if not listing.links:
@@ -382,7 +433,9 @@ def crawl_to_queue(
                             if exc.key != "error.job_structure":
                                 raise
                             progress(translate(language, "ai_analyzing_detail"))
-                            text = analyze_detail(detail_html, ai_config, ai_key)
+                            text = analyze_with_backup(
+                                lambda config: analyze_detail(detail_html, config, ai_key),
+                                ai_config, language, stop, progress)
                         if stop.is_set():
                             break
                     if save_pending(connection, source, text):
@@ -393,7 +446,9 @@ def crawl_to_queue(
                 except (EvaluationError, OSError, UnicodeError, sqlite3.Error) as exc:
                     if stop.is_set():
                         break
-                    if isinstance(exc, EvaluationError) and exc.key == "error.website_forbidden":
+                    if isinstance(exc, EvaluationError) and exc.key in (
+                        "error.website_forbidden", "error.website_rate_limit",
+                    ):
                         raise
                     detail = exc.localized(language) if isinstance(exc, EvaluationError) else str(exc)
                     failures.append(f"{link}: {detail}")
@@ -437,7 +492,6 @@ def run_website(
             else:
                 saved += 1
                 on_job(JobRecord(source, result))
-        export_csv(connection, directory / "csv")
     finally:
         connection.close()
     return saved, failures, listing.limited

@@ -1,22 +1,28 @@
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 import queue
 import re
 import sqlite3
 import threading
+from time import monotonic
 import tkinter as tk
 from tkinter import messagebox, ttk
+from urllib.parse import urlsplit
+import webbrowser
 
 from .activity_log import ActivityLog, development_console
 from .core import (
-    AppConfig, EvaluationError, load_config,
+    AppConfig, EvaluationError, MODEL_CATALOG_ENDPOINTS, fetch_model_catalog, load_config,
     JobRecord, load_jobs, open_database, pending_count, polish_requirements,
-    process_pending, save_config, validate_config,
+    process_pending, reset_database, save_config, save_pending, validate_config,
 )
 from .crawler import crawl_to_queue, normalize_url
 from .data_paths import prepare_data_directory
-from .evaluation_page import EvaluationPage
+from .evaluation_page import EvaluationPage, LinkedInImportDialog
 from .home_page import HomePage
 from .i18n import Language, translate
 from .settings_page import RequirementsPreview, SettingsPage
@@ -46,6 +52,15 @@ class PolishDone:
 
 
 @dataclass(frozen=True)
+class CatalogDone:
+    provider: str
+    identity: tuple[str, bytes]
+    manual: bool
+    models: list[str] | None = None
+    error: ErrorEvent | None = None
+
+
+@dataclass(frozen=True)
 class CrawlDone:
     saved: int
     failures: list[str]
@@ -61,7 +76,7 @@ class ErrorEvent:
     log_detail: str = ""
 
 
-AppEvent = ProgressEvent | JobEvent | BatchDone | CrawlDone | PolishDone | ErrorEvent
+AppEvent = ProgressEvent | JobEvent | BatchDone | CrawlDone | PolishDone | CatalogDone | ErrorEvent
 
 
 class CareerApp:
@@ -75,6 +90,8 @@ class CareerApp:
         self.stop_event = threading.Event()
         self.activity = ""
         self.events: queue.Queue[AppEvent] = queue.Queue()
+        self.catalog_attempts: dict[str, tuple[tuple[str, bytes], float]] = {}
+        self.catalog_pending: set[str] = set()
         self.preview: RequirementsPreview | None = None
         root.geometry("1180x820")
         root.minsize(980, 650)
@@ -109,12 +126,16 @@ class CareerApp:
         self.page_host.rowconfigure(0, weight=1)
         self.settings_page = SettingsPage(
             self.page_host, self.config, self.save, self.polish,
-            lambda provider: self.log("INFO", "log_provider", provider=provider))
+            lambda provider: self.log("INFO", "log_provider", provider=provider),
+            self.reset_jobs, self.fetch_models)
         self.evaluation_page = EvaluationPage(
             self.page_host, self.language, directory, self.start, self.stop_crawl,
             self.process, self.save_site, self.remove_site,
             lambda category: self.log("INFO", "log_filter", category=self.text(
                 "filter_all" if category == "all" else category)),
+            lambda: self.start(auto=True),
+            self.open_linkedin,
+            self.open_linkedin_import,
         )
         self.evaluation_page.website_entry.configure(values=self.config["websites"])
         if self.config["websites"]:
@@ -271,7 +292,7 @@ class CareerApp:
         self.running = busy
         self.activity = activity if busy else ""
         self.settings_page.set_busy(busy)
-        self.evaluation_page.set_busy(busy, activity == "crawl")
+        self.evaluation_page.set_busy(busy, activity in ("crawl", "auto"))
         self.language_button.state(["disabled"] if busy else ["!disabled"])
 
     def refresh_pending(self) -> None:
@@ -304,6 +325,54 @@ class CareerApp:
         self.evaluation_page.website_entry.set(url)
         self.evaluation_page.set_status("site_saved")
         self.log("INFO", "site_saved")
+
+    def open_linkedin(self) -> None:
+        try:
+            opened = webbrowser.open_new_tab("https://www.linkedin.com/jobs/")
+        except (OSError, webbrowser.Error):
+            opened = False
+        if not opened:
+            self.show_error("open_linkedin", EvaluationError("error.open_linkedin"))
+            return
+        self.log("INFO", "linkedin_opened")
+
+    def open_linkedin_import(self) -> None:
+        if not self.running:
+            LinkedInImportDialog(self.root, self.language, self.import_linkedin_job)
+
+    def import_linkedin_job(self, url: str, content: str) -> bool:
+        if self.running:
+            self.show_error("import_linkedin", EvaluationError(self.text("wait_close")))
+            return False
+        try:
+            try:
+                parts = urlsplit(normalize_url(url))
+            except EvaluationError as exc:
+                raise EvaluationError("error.linkedin_job_url") from exc
+            host = parts.hostname or ""
+            match = re.fullmatch(r"/jobs/view/(?:[^/]+-)?([0-9]+)/?", parts.path)
+            if (parts.scheme != "https" or parts.port not in (None, 443) or not match
+                    or not (host == "linkedin.com" or host.endswith(".linkedin.com"))):
+                raise EvaluationError("error.linkedin_job_url")
+            source = f"https://www.linkedin.com/jobs/view/{match[1]}/"
+            content = content.strip()
+            if not content:
+                raise EvaluationError("error.empty_markdown")
+            if len(content) > 30_000:
+                raise EvaluationError("error.linkedin_job_size")
+            connection = open_database(self.directory / "jobs.sqlite3")
+            try:
+                changed = save_pending(connection, source, content)
+            finally:
+                connection.close()
+        except (EvaluationError, OSError, sqlite3.Error) as exc:
+            self.show_error("import_linkedin", exc)
+            return False
+        self.refresh_pending()
+        key = "linkedin_imported" if changed else "job_unchanged"
+        self.evaluation_page.set_status(key)
+        self.log("INFO", key)
+        return True
 
     def remove_site(self) -> None:
         url = self.evaluation_page.website_entry.get().strip()
@@ -338,6 +407,86 @@ class CareerApp:
             return
         self.evaluation_page.set_jobs(jobs)
         self.home_page.update_jobs(jobs)
+
+    def reset_jobs(self) -> None:
+        if self.running:
+            return
+        for key in ("reset_confirm", "reset_final_confirm"):
+            if not messagebox.askyesno(self.text("reset_db"), self.text(key),
+                                       parent=self.root, default=messagebox.NO):
+                return
+        try:
+            reset_database(self.directory / "jobs.sqlite3")
+        except (OSError, sqlite3.Error) as exc:
+            self.show_error("reset_db", exc)
+            return
+        self.reload_jobs()
+        self.refresh_pending()
+        self.evaluation_page.set_status("reset_done")
+        self.log("INFO", "reset_done")
+
+    def fetch_models(self, manual: bool = True) -> None:
+        if self.running:
+            return
+        settings = self.settings_page.read_settings()
+        settings["base_url"] = settings["base_url"].rstrip("/")
+        provider = settings["provider"]
+        key = self.api_key(settings)
+        identity = (settings["base_url"], sha256(key.encode("utf-8")).digest())
+        last = self.catalog_attempts.get(provider)
+        if last and last[0] != identity:
+            self.settings_page.set_model_catalog(provider, None)
+            self.catalog_attempts.pop(provider)
+        if provider in self.catalog_pending:
+            return
+        if settings["base_url"] != MODEL_CATALOG_ENDPOINTS.get(provider) or not key:
+            if manual:
+                error = ("error.catalog_endpoint" if settings["base_url"] != MODEL_CATALOG_ENDPOINTS.get(provider)
+                         else "error.api_key")
+                self.show_error("fetch_models", EvaluationError(error))
+            return
+        now = monotonic()
+        if not manual and last and last[0] == identity and now - last[1] < 300:
+            return
+        self.catalog_attempts[provider] = (identity, now)
+        self.catalog_pending.add(provider)
+
+        def worker() -> None:
+            try:
+                models = fetch_model_catalog(settings, key)
+                self.events.put(CatalogDone(provider, identity, manual, models=models))
+            except (EvaluationError, OSError, UnicodeError) as exc:
+                self.events.put(CatalogDone(provider, identity, manual,
+                                            error=self.worker_error("fetch_models", exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_catalog(self, event: CatalogDone) -> None:
+        self.catalog_pending.discard(event.provider)
+        if self.settings_page.provider == event.provider:
+            settings = self.settings_page.read_settings()
+            identity = (settings["base_url"].rstrip("/"),
+                        sha256(self.api_key(settings).encode("utf-8")).digest())
+            if identity != event.identity:
+                self.catalog_attempts.pop(event.provider, None)
+                return
+        if event.error is not None:
+            self.log("ERROR", "log_error", action=self.text("fetch_models"), error=event.error.code)
+            if event.error.log_detail:
+                self.log_failures([event.error.log_detail])
+            if event.manual:
+                messagebox.showerror(self.text("fetch_models"), event.error.detail, parent=self.root)
+        elif event.models is not None:
+            self.settings_page.set_model_catalog(event.provider, event.models)
+            self.log("INFO", "models_loaded", count=len(event.models))
+            if event.manual:
+                messagebox.showinfo(self.text("fetch_models"),
+                                    self.text("models_loaded", count=len(event.models)), parent=self.root)
+
+    def api_key(self, config: AppConfig) -> str:
+        return (config["api_key"] or
+                (os.environ.get(config["api_key_env"], "").strip()
+                 if config["provider"] == "openai" else ""))
 
     def polish(self) -> None:
         if self.running:
@@ -385,7 +534,7 @@ class CareerApp:
         self.log("INFO", "polish_cancelled")
         self.preview = None
 
-    def start(self) -> None:
+    def start(self, *, auto: bool = False) -> None:
         if self.running:
             return
         website = self.evaluation_page.website_entry.get().strip()
@@ -406,6 +555,19 @@ class CareerApp:
             return
         ai_config: AppConfig | None = None
         ai_key = ""
+        evaluation_config: AppConfig | None = None
+        evaluation_key = ""
+        if auto:
+            try:
+                evaluation_config = self.read_config()
+                evaluation_key = self.api_key(evaluation_config)
+                if not evaluation_key and evaluation_config["provider"] != "custom":
+                    raise EvaluationError("error.api_key")
+            except EvaluationError as exc:
+                self.show_error("cannot_start", exc)
+                return
+            if not messagebox.askyesno(self.text("auto_run"), self.text("auto_confirm"), parent=self.root):
+                return
         if self.evaluation_page.ai_assist.get():
             answer = messagebox.askyesnocancel(
                 self.text("ai_assist"), self.text("ai_crawl_confirm"), parent=self.root)
@@ -427,7 +589,7 @@ class CareerApp:
             else:
                 self.log("INFO", "ai_crawl_rules_only")
         self.stop_event.clear()
-        self.set_busy(True, "crawl")
+        self.set_busy(True, "auto" if auto else "crawl")
         self.evaluation_page.set_status("finding_jobs")
         self.log("INFO", "finding_jobs")
         self.show_page("evaluation")
@@ -445,6 +607,19 @@ class CareerApp:
                     result = crawl_to_queue(*args)
                 else:
                     result = crawl_to_queue(*args, ai_config=ai_config, ai_key=ai_key)
+                if evaluation_config is not None and not result[2] and not self.stop_event.is_set():
+                    connection = open_database(self.directory / "jobs.sqlite3")
+                    try:
+                        has_pending = pending_count(connection) > 0
+                    finally:
+                        connection.close()
+                    if has_pending:
+                        saved, failures, stopped = process_pending(
+                            evaluation_config, evaluation_key, self.directory, self.stop_event,
+                            lambda text: self.events.put(ProgressEvent(text)),
+                            lambda job: self.events.put(JobEvent(job)))
+                        self.events.put(BatchDone(saved, [*result[1], *failures], stopped))
+                        return
                 self.events.put(CrawlDone(*result))
             except (EvaluationError, OSError, UnicodeError, sqlite3.Error) as exc:
                 self.events.put(self.worker_error("processing_failed", exc))
@@ -452,7 +627,7 @@ class CareerApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def stop_crawl(self) -> None:
-        if self.running and self.activity == "crawl":
+        if self.running and self.activity in ("crawl", "auto"):
             self.stop_event.set()
             self.log("INFO", "log_stop_requested")
             self.evaluation_page.buttons["stop_crawl"].state(["disabled"])
@@ -522,6 +697,9 @@ class CareerApp:
                 self.log("INFO", "log_polish_ready")
                 self.preview = RequirementsPreview(
                     self.root, event.text, self.language, self.apply_polish, self.cancel_polish)
+                continue
+            if isinstance(event, CatalogDone):
+                self.finish_catalog(event)
                 continue
             self.set_busy(False)
             self.refresh_pending()

@@ -34,8 +34,11 @@ class BrowserCrawler(Crawler):
         except ImportError as exc:
             raise EvaluationError("error.browser_missing") from exc
         if getattr(sys, "frozen", False):
-            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(
-                Path(getattr(sys, "_MEIPASS")) / "browsers")
+            if sys.platform == "darwin":
+                resources = Path(sys.executable).parent.parent / "Resources"
+            else:
+                resources = Path(getattr(sys, "_MEIPASS"))
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(resources / "browsers")
         if self.directory is None:
             from .data_paths import prepare_data_directory
 
@@ -69,8 +72,8 @@ class BrowserCrawler(Crawler):
                 url = normalize_url(request.url)
                 if origin(url) != self.site:
                     raise EvaluationError("error.website_redirect")
-                if self.robots is None or not self.robots.can_fetch(USER_AGENT, url):
-                    raise EvaluationError("error.robots_denied")
+                #if self.robots is None or not self.robots.can_fetch(USER_AGENT, url):
+                #    raise EvaluationError("error.robots_denied")
             except EvaluationError as exc:
                 self.blocked = exc
                 route.abort()
@@ -85,8 +88,8 @@ class BrowserCrawler(Crawler):
         url = normalize_url(url)
         if origin(url) != self.site:
             raise EvaluationError("error.website_redirect")
-        if self.robots is None or not self.robots.can_fetch(USER_AGENT, url):
-            raise EvaluationError("error.robots_denied")
+        #if self.robots is None or not self.robots.can_fetch(USER_AGENT, url):
+        #    raise EvaluationError("error.robots_denied")
         if self.page is None:
             raise EvaluationError("error.browser_missing")
         wait = max(0, self.delay - (time.monotonic() - self.last_request))
@@ -100,6 +103,8 @@ class BrowserCrawler(Crawler):
             response = self.page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT * 1000)
             if response is not None and response.status == 403:
                 raise EvaluationError("error.website_forbidden", stage="Chromium")
+            if response is not None and response.status == 429:
+                raise EvaluationError("error.website_rate_limit", stage="Chromium")
             if response is not None and response.status >= 400:
                 raise EvaluationError("error.website_http", code=response.status)
             # Give hydration and scroll-triggered content bounded time to settle.

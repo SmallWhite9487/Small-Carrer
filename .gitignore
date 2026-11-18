@@ -13,7 +13,9 @@ log/
 build/
 dist/
 *.spec
-packing/
-packing
+!packing/SmallCareer.spec
+packing/browsers/
+packing/legacy/
+.DS_Store
 __pycache__/
 *.py[cod]

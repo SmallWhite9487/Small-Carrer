@@ -6,6 +6,12 @@ from .core import AppConfig
 from .i18n import Language, translate
 from .ui import BORDER, SURFACE, TEXT, ScrollArea, configure_window_icon
 
+MODEL_CHOICES = {
+    "openai": ("gpt-5.6-luna", "gpt-5.4-mini", "gpt-4o-mini"),
+    "gemini": ("gemini-3.5-flash-lite", "gemini-4-hydrogen"),
+    "custom": (),
+}
+
 
 class RequirementsPreview(tk.Toplevel):
     def __init__(
@@ -61,7 +67,8 @@ class SettingsPage(ttk.Frame):
     def __init__(
         self, parent: ttk.Frame, config: AppConfig,
         on_save: Callable[[], None], on_polish: Callable[[], None],
-        on_provider: Callable[[str], None],
+        on_provider: Callable[[str], None], on_reset: Callable[[], None],
+        on_models: Callable[[bool], None],
     ) -> None:
         super().__init__(parent, padding=28)
         self.language = config["language"]
@@ -71,6 +78,14 @@ class SettingsPage(ttk.Frame):
         self.profiles[self.provider] = {
             "base_url": config["base_url"], "model": config["model"], "api_key": config["api_key"],
         }
+        self.models = {
+            name: list(dict.fromkeys(filter(None, [
+                self.profiles.get(name, {}).get("model", MODEL_CHOICES[name][0] if MODEL_CHOICES[name] else ""),
+                *config.get("backup_models", {}).get(name, []),
+            ]))) for name in MODEL_CHOICES
+        }
+        self.catalog: dict[str, list[str]] = {}
+        self.model_drafts: dict[str, str] = {}
         self.labels: dict[str, ttk.Label] = {}
         self.entries: dict[str, ttk.Entry] = {}
         self.title_label = ttk.Label(self, style="Title.TLabel")
@@ -117,12 +132,32 @@ class SettingsPage(ttk.Frame):
         self.key_entry.bind("<<Cut>>", self.cut_key)
         self.key_entry.pack(fill="x", pady=(8, 4))
         self.add_label(service, "key_hint")
-        for field in ("base_url", "model"):
-            self.add_label(service, field)
-            entry = ttk.Entry(service)
-            entry.insert(0, config[field])
-            entry.pack(fill="x", pady=(4, 8))
-            self.entries[field] = entry
+        self.add_label(service, "base_url")
+        endpoint = ttk.Entry(service)
+        endpoint.insert(0, config["base_url"])
+        endpoint.pack(fill="x", pady=(4, 8))
+        self.entries["base_url"] = endpoint
+        self.add_label(service, "model", title=True)
+        self.add_label(service, "model_hint")
+        model_row = ttk.Frame(service, style="Card.TFrame")
+        model_row.pack(fill="x", pady=(4, 8))
+        self.choose_models = ttk.Menubutton(model_row)
+        self.choose_models.pack(side="left")
+        self.model_menu = tk.Menu(self.choose_models, tearoff=False, postcommand=lambda: on_models(False))
+        self.choose_models.configure(menu=self.model_menu)
+        self.fetch_models = ttk.Button(model_row, command=lambda: on_models(True))
+        self.fetch_models.pack(side="left", padx=4)
+        draft = ttk.Entry(model_row, width=20)
+        draft.pack(side="left", fill="x", expand=True, padx=4)
+        self.entries["model"] = draft
+        draft.bind("<Return>", self.add_custom_model)
+        self.add_model_button = ttk.Button(model_row, command=self.add_custom_model)
+        self.add_model_button.pack(side="right")
+        self.model_chips = ttk.Frame(service, style="Card.TFrame")
+        self.model_chips.pack(fill="x")
+        self.distribute_models = tk.BooleanVar(value=config.get("distribute_models", False))
+        self.distribute_button = ttk.Checkbutton(service, variable=self.distribute_models)
+        self.distribute_button.pack(anchor="w", pady=4)
         self.add_label(service, "service_hint")
         self.advanced_button = ttk.Button(service, command=self.toggle_advanced)
         self.advanced_button.pack(anchor="w", pady=(12, 0))
@@ -135,30 +170,77 @@ class SettingsPage(ttk.Frame):
         self.advanced_visible = False
         self.save_button = ttk.Button(self, style="Accent.TButton", command=on_save)
         self.save_button.pack(anchor="w", pady=(16, 0))
+        self.reset_button = ttk.Button(service, command=on_reset)
+        self.reset_button.pack(anchor="w", pady=(8, 0))
         self.refresh_language(self.language)
+
+    def add_custom_model(self, event: tk.Event | None = None) -> None:
+        entry = self.entries["model"]
+        if entry.instate(["disabled"]):
+            return
+        name = entry.get().strip()
+        if name and name not in self.models[self.provider]:
+            self.toggle_model(name)
+        entry.delete(0, "end")
+
+    def toggle_model(self, name: str) -> None:
+        if self.choose_models.instate(["disabled"]):
+            return
+        selected = self.models[self.provider]
+        if name in selected:
+            selected.remove(name)
+        else:
+            selected.append(name)
+        self.refresh_models()
+
+    def set_model_catalog(self, provider: str, models: list[str] | None) -> None:
+        if models is None:
+            self.catalog.pop(provider, None)
+        else:
+            self.catalog[provider] = models
+        if self.provider == provider:
+            self.refresh_models()
+
+    def refresh_models(self) -> None:
+        selected = self.models[self.provider]
+        self.model_menu.delete(0, "end")
+        available = self.catalog.get(self.provider, MODEL_CHOICES[self.provider])
+        for model in dict.fromkeys([*available, *selected]):
+            self.model_menu.add_command(label=("✓ " if model in selected else "    ") + model,
+                                        command=lambda name=model: self.toggle_model(name))
+        for chip in self.model_chips.winfo_children():
+            chip.destroy()
+        for index, model in enumerate(selected):
+            label = model if len(model) <= 23 else model[:22] + "…"
+            chip = ttk.Button(self.model_chips, text=f"{index + 1}. {label}  ×",
+                              command=lambda name=model: self.toggle_model(name))
+            chip.grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 4), pady=2)
 
     def switch_provider(self, provider: str) -> None:
         if provider == self.provider:
             return
+        self.model_drafts[self.provider] = self.entries["model"].get()
         self.profiles[self.provider] = {
             "base_url": self.entries["base_url"].get(),
-            "model": self.entries["model"].get(),
+            "model": next(iter(self.models[self.provider]), ""),
             "api_key": self.key_entry.get(),
         }
         self.provider = provider
         defaults = {
             "openai": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "api_key": ""},
             "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta",
-                       "model": "gemini-2.5-flash", "api_key": ""},
+                       "model": MODEL_CHOICES["gemini"][0], "api_key": ""},
             "custom": {"base_url": "http://localhost:11434/v1", "model": "", "api_key": ""},
         }
         profile = self.profiles.get(self.provider, defaults[self.provider])
-        for field in ("base_url", "model"):
-            self.entries[field].delete(0, "end")
-            self.entries[field].insert(0, profile[field])
+        self.entries["base_url"].delete(0, "end")
+        self.entries["base_url"].insert(0, profile["base_url"])
+        self.entries["model"].delete(0, "end")
+        self.entries["model"].insert(0, self.model_drafts.get(provider, ""))
         self.key_entry.delete(0, "end")
         self.key_entry.insert(0, profile["api_key"])
         self.refresh_provider_tabs()
+        self.refresh_models()
         self.on_provider(self.provider)
 
     def refresh_provider_tabs(self) -> None:
@@ -205,24 +287,29 @@ class SettingsPage(ttk.Frame):
     def refresh_language(self, language: Language) -> None:
         self.language = language
         self.refresh_provider_tabs()
+        self.refresh_models()
         self.title_label.configure(text=translate(language, "settings_tab"))
         self.intro.configure(text=translate(language, "settings_intro"))
         for key, label in self.labels.items():
             label.configure(text=translate(language, key))
         for key, button in (("save", self.save_button), ("polish", self.polish_button),
-                            ("advanced", self.advanced_button)):
+                            ("advanced", self.advanced_button), ("reset_db", self.reset_button),
+                            ("choose_models", self.choose_models), ("add_model", self.add_model_button),
+                            ("fetch_models", self.fetch_models), ("distribute_models", self.distribute_button)):
             button.configure(text=translate(language, key))
 
     def read_settings(self) -> AppConfig:
+        selected = self.models[self.provider]
+        primary = next(iter(selected), "")
         profiles = {name: profile.copy() for name, profile in self.profiles.items()}
         profiles[self.provider] = {
             "base_url": self.entries["base_url"].get().strip(),
-            "model": self.entries["model"].get().strip(),
+            "model": primary,
             "api_key": self.key_entry.get().strip(),
         }
         return AppConfig(
             base_url=self.entries["base_url"].get().strip(),
-            model=self.entries["model"].get().strip(),
+            model=primary,
             api_key_env=self.entries["api_key_env"].get().strip(),
             user_requirements=self.requirements.get("1.0", "end-1c").strip(),
             language=self.language,
@@ -231,6 +318,8 @@ class SettingsPage(ttk.Frame):
             websites=[],
             max_pages=10,
             profiles=profiles,
+            backup_models={name: models[1:] for name, models in self.models.items() if len(models) > 1},
+            distribute_models=self.distribute_models.get(),
         )
 
     def apply_requirements(self, text: str) -> None:
@@ -243,5 +332,7 @@ class SettingsPage(ttk.Frame):
             entry.configure(state=state)
         self.requirements.configure(state=state)
         for button in (self.save_button, self.polish_button, self.advanced_button,
+                       self.reset_button, self.choose_models, self.fetch_models, self.add_model_button,
+                       self.distribute_button,
                        *self.provider_buttons.values()):
             button.state(["disabled"] if busy else ["!disabled"])

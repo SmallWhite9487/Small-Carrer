@@ -139,6 +139,76 @@ class AIBrowseTests(unittest.TestCase):
                 else:
                     self.assertEqual(body["response_format"]["json_schema"], ai_browse.LIST_SCHEMA)
 
+    def test_crawl_uses_backup_for_listing_and_detail_api_limits(self):
+        primary = self.config["model"]
+        self.config["backup_models"] = {"openai": ["backup"]}
+        job_url = "https://example.com/roles/1"
+        progress = []
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("modules.crawler.Crawler") as factory, \
+                patch("modules.ai_browse.request_json", side_effect=[
+                    core.EvaluationError("error.http", code=429),
+                    {"job_indices": [0], "next_index": -1},
+                    core.EvaluationError("error.http", code=503),
+                    {"is_job": True},
+                ]) as request:
+            client = factory.return_value
+            client.website = self.url
+            client._get.side_effect = [
+                ('<a href="/roles/1">Analyst</a>', self.url),
+                ("<h1>Analyst</h1><p>Remote reporting work</p>", job_url),
+            ]
+            self.assertEqual(crawler.crawl_to_queue(
+                self.url, Path(directory), "en", 1, threading.Event(), progress.append,
+                ai_config=self.config, ai_key="key"), (1, [], False, False))
+        self.assertEqual([call.args[0]["model"] for call in request.call_args_list],
+                         [primary, "backup", primary, "backup"])
+        self.assertTrue(any("429" in line and "backup" in line for line in progress))
+        self.assertEqual(client._get.call_count, 2)
+
+    def test_listing_api_limit_keeps_links_already_found_by_rules(self):
+        job_url = "https://example.com/jobs/1"
+        progress = []
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("modules.crawler.Crawler") as factory, \
+                patch("modules.ai_browse.request_json",
+                      side_effect=core.EvaluationError("error.http", code=429)) as request:
+            client = factory.return_value
+            client.website = self.url
+            client._get.side_effect = [
+                ('<a href="/jobs/1">Analyst</a>', self.url), (detail(), job_url),
+            ]
+            saved, failures, stopped, limited = crawler.crawl_to_queue(
+                self.url, Path(directory), "en", 1, threading.Event(), progress.append,
+                ai_config=self.config, ai_key="key")
+        self.assertEqual((saved, stopped, limited), (1, False, False))
+        self.assertEqual(len(failures), 1)
+        self.assertIn("429", failures[0])
+        self.assertTrue(any("already found" in line for line in progress))
+        request.assert_called_once()
+
+    def test_crawl_distinguishes_empty_ai_selection_from_rejected_links(self):
+        url = "https://www.linkedin.com/"
+        html = '<h1>Jobs</h1><a href="/jobs/search/">Search jobs</a>'
+        for indices, key, message in (
+            ([], "error.ai_no_job_links", "did not select any job links"),
+            ([0], "error.ai_job_links_rejected", "selected 1 link"),
+        ):
+            with self.subTest(indices=indices), tempfile.TemporaryDirectory() as directory, \
+                    patch("modules.crawler.Crawler") as factory, \
+                    patch("modules.ai_browse.request_json",
+                          return_value={"job_indices": indices, "next_index": -1}):
+                client = factory.return_value
+                client.website = url
+                client._get.return_value = (html, url)
+                with self.assertRaises(core.EvaluationError) as raised:
+                    crawler.crawl_to_queue(
+                        url, Path(directory), "en", 1, threading.Event(), lambda text: None,
+                        ai_config=self.config, ai_key="key")
+                self.assertEqual(raised.exception.key, key)
+                self.assertIn(message, raised.exception.localized("en"))
+                client._get.assert_called_once_with(url)
+
     def test_ai_selected_link_obeys_robots(self):
         instance = crawler.Crawler(self.url)
         robot = RobotFileParser()

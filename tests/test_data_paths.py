@@ -19,6 +19,19 @@ class DataPathTests(unittest.TestCase):
                     patch.object(core.sys, "executable", str(base / "SmallCareer.exe")):
                 self.assertEqual(prepare_data_directory().resolve(), (base / "data").resolve())
 
+    def test_macos_frozen_app_uses_application_support_not_the_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            executable = home / "Applications" / "SmallCareer.app" / "Contents" / "MacOS" / "SmallCareer"
+            with patch.object(core.sys, "platform", "darwin"), \
+                    patch.object(core.sys, "frozen", True, create=True), \
+                    patch.object(core.sys, "executable", str(executable)), \
+                    patch.object(Path, "home", return_value=home):
+                directory = prepare_data_directory()
+            self.assertEqual(directory, home / "Library" / "Application Support" / "SmallCareer" / "data")
+            self.assertTrue((directory / ".legacy-imported").is_file())
+            self.assertFalse(executable.parent.exists())
+
     def test_migration_preserves_existing_data_and_imports_only_once(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

@@ -100,6 +100,37 @@ class CrawlerTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertIsNone(instance.robots)
 
+    def test_linkedin_navigation_links_are_not_job_details(self):
+        url = "https://www.linkedin.com/"
+        html = """
+            <a href="/jobs/search?trk=homepage">Search</a>
+            <a href="/jobs/engineering-jobs-tokyo">Engineering jobs</a>
+            <a href="/jobs/view/analyst-12345">Analyst</a>
+        """
+        self.assertEqual(crawler.listing_links(html, url).links,
+                         ["https://www.linkedin.com/jobs/view/analyst-12345"])
+
+    def test_detail_429_stops_collection_and_retains_saved_jobs(self):
+        url = "https://example.com/search"
+        with tempfile.TemporaryDirectory() as directory, patch("modules.crawler.Crawler") as factory:
+            path = Path(directory)
+            client = factory.return_value
+            client.website = url
+            client._get.return_value = (''.join(f'<a href="/jobs/{i}">Job</a>' for i in range(3)), url)
+            client.detail.side_effect = [
+                ("https://example.com/jobs/0", "Analyst"),
+                core.EvaluationError("error.website_rate_limit", stage="HTML"),
+            ]
+            with self.assertRaises(core.EvaluationError) as error:
+                crawler.crawl_to_queue(url, path, "en", 1, threading.Event(), lambda text: None)
+            self.assertEqual(error.exception.key, "error.website_rate_limit")
+            self.assertEqual(client.detail.call_count, 2)
+            connection = core.open_database(path / "jobs.sqlite3")
+            try:
+                self.assertEqual(core.pending_count(connection), 1)
+            finally:
+                connection.close()
+
     def test_detail_403_stops_batch_without_repeated_requests(self):
         url = "https://example.com/search"
         with tempfile.TemporaryDirectory() as directory, patch("modules.crawler.Crawler") as factory:
@@ -136,7 +167,7 @@ class CrawlerTests(unittest.TestCase):
                 self.assertEqual(core.load_jobs(connection), published)
             finally:
                 connection.close()
-            self.assertTrue((path / "csv" / "coincidence.csv").exists())
+            self.assertFalse((path / "csv").exists())
 
     def test_paginated_queue_respects_duplicates_and_limit(self):
         first = "https://example.com/search"

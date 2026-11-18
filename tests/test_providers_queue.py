@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -10,6 +11,94 @@ from tests.test_app import response, result
 
 
 class ProviderQueueTests(unittest.TestCase):
+    def test_api_timeout_and_429_fall_back_in_order(self):
+        config = core.default_config()
+        config["backup_models"] = {"openai": ["second", "third"]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            conn = core.open_database(path / "jobs.sqlite3")
+            try:
+                core.save_pending(conn, "one", "First")
+            finally:
+                conn.close()
+            progress = []
+            with patch("modules.core.request_evaluation", side_effect=[
+                core.EvaluationError("error.network"), core.EvaluationError("error.http", code=429),
+                result(ai_reason="符合條件" * 70),
+            ]) as evaluate:
+                self.assertEqual(core.process_pending(
+                    config, "key", path, threading.Event(), progress.append, lambda job: None),
+                    (1, [], False))
+            self.assertEqual([call.args[1]["model"] for call in evaluate.call_args_list],
+                             [config["model"], "second", "third"])
+            self.assertTrue(any("429" in line and "third" in line for line in progress))
+
+    def test_distributed_models_overlap_and_commit_each_job_once(self):
+        config = core.default_config()
+        config.update(backup_models={"openai": ["second"]}, distribute_models=True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            conn = core.open_database(path / "jobs.sqlite3")
+            try:
+                core.save_pending(conn, "one", "First")
+                core.save_pending(conn, "two", "Second")
+            finally:
+                conn.close()
+            barrier = threading.Barrier(2, timeout=5)
+
+            def finish(content, config, key):
+                barrier.wait()
+                return result(title=config["model"])
+
+            committed = []
+            with patch("modules.core.request_evaluation", side_effect=finish):
+                self.assertEqual(core.process_pending(
+                    config, "key", path, threading.Event(), lambda text: None, committed.append),
+                    (2, [], False))
+            self.assertEqual({job.source: job.result["title"] for job in committed},
+                             {"one": config["model"], "two": "second"})
+            conn = core.open_database(path / "jobs.sqlite3")
+            try:
+                self.assertEqual(core.pending_count(conn), 0)
+                self.assertEqual(len(core.load_jobs(conn)), 2)
+            finally:
+                conn.close()
+
+    def test_legacy_jobs_migration_keeps_rows_and_allows_long_reasons(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.sqlite3"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(core.JOB_TABLE.format(table="jobs").replace(
+                    "length(ai_reason) > 0", "length(ai_reason) BETWEEN 1 AND 60"))
+                core.store_job(conn, "old", result())
+            finally:
+                conn.close()
+            conn = core.open_database(path)
+            try:
+                long_job = result(ai_reason="符合條件" * 70)
+                core.store_job(conn, "new", long_job)
+                self.assertEqual(core.load_jobs(conn),
+                                 [core.JobRecord("new", long_job), core.JobRecord("old", result())])
+            finally:
+                conn.close()
+
+    def test_live_catalog_filtering_and_gemini_pagination(self):
+        config = core.default_config()
+        config.update(provider="gemini", base_url="https://generativelanguage.googleapis.com/v1beta")
+        with patch("modules.core.build_opener") as opener:
+            request = opener.return_value.open
+            request.return_value.__enter__.return_value.read.side_effect = [
+                json.dumps({"models": [{"name": "models/one", "supportedGenerationMethods":
+                                        ["generateContent"]}, {"name": "models/embedding"}],
+                            "nextPageToken": "+token"}).encode(),
+                json.dumps({"models": [{"name": "models/two", "supportedGenerationMethods":
+                                        ["generateContent"]}]}).encode(),
+            ]
+            self.assertEqual(core.fetch_model_catalog(config, "test-key"), ["one", "two"])
+            self.assertTrue(request.call_args.args[0].full_url.endswith("?pageToken=%2Btoken"))
+            self.assertEqual(request.call_args.args[0].get_header("X-goog-api-key"), "test-key")
+
     def test_gemini_native_schema_and_response_for_jobs_and_polish(self):
         config = core.default_config()
         config["provider"] = "gemini"
@@ -82,7 +171,7 @@ class ProviderQueueTests(unittest.TestCase):
             self.assertEqual((saved, failures, stopped), (1, [], False))
             self.assertEqual(evaluate.call_count, 1)
             self.assertEqual(evaluate.call_args.args[0], "Job two")
-            self.assertTrue((path / "csv" / "coincidence.csv").exists())
+            self.assertFalse((path / "csv").exists())
 
     def test_stop_processing_keeps_remaining_queue(self):
         with tempfile.TemporaryDirectory() as directory:

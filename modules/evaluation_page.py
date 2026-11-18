@@ -102,6 +102,8 @@ class EvaluationPage(JobListPage):
         on_start: Callable[[], None], on_stop: Callable[[], None],
         on_process: Callable[[], None], on_save_site: Callable[[], None],
         on_remove_site: Callable[[], None], on_filter: Callable[[str], None],
+        on_auto: Callable[[], None], on_open_linkedin: Callable[[], None],
+        on_import_linkedin: Callable[[], None],
     ) -> None:
         super().__init__(parent, padding=28)
         self.language = language
@@ -141,6 +143,14 @@ class EvaluationPage(JobListPage):
         self.use_browser = tk.BooleanVar(value=True)
         self.browser_button = ttk.Checkbutton(self, variable=self.use_browser)
         self.browser_button.pack(anchor="w", pady=(4, 0))
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", pady=(4, 0))
+        self.buttons["auto_run"] = ttk.Button(actions, style="Accent.TButton", command=on_auto)
+        self.buttons["auto_run"].pack(side="left", padx=(0, 6))
+        self.buttons["open_linkedin"] = ttk.Button(actions, command=on_open_linkedin)
+        self.buttons["open_linkedin"].pack(side="left")
+        self.buttons["import_linkedin"] = ttk.Button(actions, command=on_import_linkedin)
+        self.buttons["import_linkedin"].pack(side="left", padx=(6, 0))
         self.website_hint = ttk.Label(self, style="Subtitle.TLabel", wraplength=850)
         self.website_hint.pack(anchor="w", pady=(6, 12))
         self.initialize_job_list(language, on_filter)
@@ -183,3 +193,44 @@ class EvaluationPage(JobListPage):
         for key, button in self.buttons.items():
             enabled = (key == "stop_crawl" and crawling) or (key != "stop_crawl" and not busy)
             button.state(["!disabled"] if enabled else ["disabled"])
+
+
+class LinkedInImportDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, language: Language,
+                 on_import: Callable[[str, str], bool]) -> None:
+        super().__init__(parent)
+        self.transient(parent)
+        configure_window_icon(self)
+        self.title(translate(language, "import_linkedin"))
+        self.geometry("620x460")
+        self.minsize(420, 330)
+        panel = ttk.Frame(self, padding=18)
+        panel.pack(fill="both", expand=True)
+        ttk.Label(panel, text=translate(language, "linkedin_import_hint"),
+                  wraplength=380).pack(anchor="w", pady=(0, 12))
+        ttk.Label(panel, text=translate(language, "linkedin_job_url")).pack(anchor="w")
+        self.url = ttk.Entry(panel)
+        self.url.pack(fill="x", pady=(3, 10))
+        ttk.Label(panel, text=translate(language, "linkedin_job_text")).pack(anchor="w")
+        controls = ttk.Frame(panel)
+        controls.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(controls, text=translate(language, "cancel"), command=self.destroy).pack(side="right")
+        self.submit = ttk.Button(controls, text=translate(language, "linkedin_add_queue"),
+                                 style="Accent.TButton", command=self.save)
+        self.submit.pack(side="right", padx=(0, 6))
+        editor = ttk.Frame(panel)
+        editor.pack(fill="both", expand=True, pady=(3, 0))
+        self.content = tk.Text(editor, wrap="word")
+        scrollbar = ttk.Scrollbar(editor, command=self.content.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.content.configure(yscrollcommand=scrollbar.set)
+        self.content.pack(fill="both", expand=True)
+        self.on_import = on_import
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.wait_visibility()
+        self.grab_set()
+        self.url.focus_set()
+
+    def save(self) -> None:
+        if self.on_import(self.url.get(), self.content.get("1.0", "end-1c")):
+            self.destroy()
